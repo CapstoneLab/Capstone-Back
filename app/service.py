@@ -74,3 +74,48 @@ class ResultStore:
         if not path.exists():
             return None
         return json.loads(path.read_text(encoding="utf-8"))
+
+
+class UbuntuResultFetcher:
+    def __init__(self) -> None:
+        self.settings = get_settings()
+
+    def fetch_steps(self, run_id: str) -> list[dict] | None:
+        if not run_id:
+            return None
+
+        working_dir = self.settings.ubuntu_working_dir.strip()
+        if not working_dir:
+            return None
+
+        remote_path = f"{working_dir.rstrip('/')}/runs/{run_id}/pipeline_result.json"
+
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(
+                hostname=self.settings.ubuntu_ssh_host,
+                port=self.settings.ubuntu_ssh_port,
+                username=self.settings.ubuntu_ssh_user,
+                password=self.settings.ubuntu_ssh_password,
+                timeout=5,
+                look_for_keys=False,
+                allow_agent=False,
+            )
+
+            sftp = ssh.open_sftp()
+            with sftp.open(remote_path, "r") as fp:
+                raw = fp.read()
+            sftp.close()
+            ssh.close()
+
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", "replace")
+
+            obj = json.loads(raw)
+            steps = obj.get("steps")
+            if isinstance(steps, list):
+                return [x for x in steps if isinstance(x, dict)]
+            return None
+        except Exception:
+            return None

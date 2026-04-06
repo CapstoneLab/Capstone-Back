@@ -106,13 +106,20 @@ def _print_pipeline_result_summary(data: dict, metadata: dict) -> None:
     if result_file:
         print(f"result file: {result_file}")
 
-    exact_steps = _load_steps_from_ubuntu(run_id=run_id)
+    exact_steps = data.get("steps")
+    if not isinstance(exact_steps, list) or not exact_steps:
+        exact_steps = _load_steps_from_ubuntu(run_id=run_id)
     if exact_steps is not None:
+        has_skipped = False
         for step in exact_steps:
             step_name = step.get("step_name", "unknown")
             step_status = step.get("status", "unknown")
             summary = step.get("summary_message") or "no message"
+            if step_status == "skipped":
+                has_skipped = True
             print(f"- {step_name}: {step_status} ({summary})")
+        if has_skipped and status == "success":
+            print("note: overall pipeline status can be success even when some steps are skipped")
         return
 
     step_map = {
@@ -142,17 +149,25 @@ def _print_pipeline_result_summary(data: dict, metadata: dict) -> None:
         message = m.group("msg")
         per_file.setdefault(file_name, []).append(message)
 
+    has_skipped = False
     for file_name, step_name in step_map.items():
         if file_name not in per_file:
             continue
 
         exit_code = None
+        no_tests_detected = False
         for msg in per_file[file_name]:
             m = re.search(r"\[exit_code\]\s(-?\d+)", msg)
             if m:
                 exit_code = int(m.group(1))
+            if step_name == "test" and "No tests found" in msg:
+                no_tests_detected = True
 
-        if exit_code is None:
+        if step_name == "test" and no_tests_detected:
+            step_status = "skipped"
+            summary = "No tests found; skipped"
+            has_skipped = True
+        elif exit_code is None:
             step_status = "pending"
             summary = "no exit_code found"
         elif exit_code == 0:
@@ -163,6 +178,9 @@ def _print_pipeline_result_summary(data: dict, metadata: dict) -> None:
             summary = f"exit_code={exit_code}"
 
         print(f"- {step_name}: {step_status} ({summary})")
+
+    if has_skipped and status == "success":
+        print("note: overall pipeline status can be success even when some steps are skipped")
 
 
 def _load_steps_from_ubuntu(run_id: str) -> list[dict] | None:
@@ -193,6 +211,7 @@ def _load_steps_from_ubuntu(run_id: str) -> list[dict] | None:
             port=port,
             username=user,
             password=password,
+            timeout=5,
             look_for_keys=False,
             allow_agent=False,
         )
@@ -211,7 +230,7 @@ def _load_steps_from_ubuntu(run_id: str) -> list[dict] | None:
         if isinstance(steps, list):
             return [x for x in steps if isinstance(x, dict)]
         return None
-    except Exception:
+    except BaseException:
         return None
 
 

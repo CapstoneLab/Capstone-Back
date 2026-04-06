@@ -9,12 +9,13 @@ from app.models import (
     StartPipelineRequest,
     StartPipelineResponse,
 )
-from app.service import ResultStore, TriggerService
+from app.service import ResultStore, TriggerService, UbuntuResultFetcher
 
 app = FastAPI(title="Windows CI Trigger Backend", version="1.0.0")
 
 trigger_service = TriggerService()
 result_store = ResultStore()
+result_fetcher = UbuntuResultFetcher()
 job_state: dict[str, dict] = {}
 
 
@@ -53,6 +54,15 @@ def start_pipeline(req: StartPipelineRequest) -> StartPipelineResponse:
 @app.post("/get-results")
 def receive_result(payload: PipelineResultPayload) -> dict[str, str]:
     obj = payload.model_dump(mode="json")
+
+    # Prefer exact step statuses from Ubuntu pipeline_result.json
+    # so Windows output matches Ubuntu summary (e.g. skipped vs success).
+    if not obj.get("steps"):
+        run_id = (obj.get("metadata") or {}).get("run_id", "")
+        steps = result_fetcher.fetch_steps(run_id=run_id)
+        if steps:
+            obj["steps"] = steps
+
     result_store.save(payload.job_id, obj)
 
     existing = job_state.get(payload.job_id, {})

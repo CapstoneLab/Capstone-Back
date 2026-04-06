@@ -25,6 +25,7 @@ class PipelineResultPayload(BaseModel):
     ended_at: datetime | None = None
     logs: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    steps: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class PipelineResultResponse(BaseModel):

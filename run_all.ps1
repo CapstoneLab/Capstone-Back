@@ -17,7 +17,7 @@ if (Test-Path '.venv/Scripts/python.exe') {
     exit 1
 }
 
-if (-not $env:UBUNTU_SSH_HOST) { $env:UBUNTU_SSH_HOST = '192.168.100.142' }
+if (-not $env:UBUNTU_SSH_HOST) { $env:UBUNTU_SSH_HOST = '192.168.0.18' }
 if (-not $env:UBUNTU_SSH_PORT) { $env:UBUNTU_SSH_PORT = '22' }
 if (-not $env:UBUNTU_SSH_USER) { $env:UBUNTU_SSH_USER = 'capstone' }
 if (-not $env:UBUNTU_SSH_PASSWORD) { $env:UBUNTU_SSH_PASSWORD = '1111' }
@@ -28,11 +28,12 @@ if (-not $env:UBUNTU_PYTHON_COMMAND) { $env:UBUNTU_PYTHON_COMMAND = 'python3' }
 if (-not $env:UBUNTU_SHELL_PRELUDE) {
     $env:UBUNTU_SHELL_PRELUDE = 'export PATH="$HOME/.local/bin:$PATH" && export NVM_DIR="$HOME/.nvm" && source "$NVM_DIR/nvm.sh"'
 }
-if (-not $env:WINDOWS_CALLBACK_BASE_URL) { $env:WINDOWS_CALLBACK_BASE_URL = 'http://192.168.100.1:8000' }
+if (-not $env:WINDOWS_CALLBACK_BASE_URL) { $env:WINDOWS_CALLBACK_BASE_URL = 'http://192.168.0.2:8000' }
 
 $backendStartedByScript = $false
 $backendProcess = $null
 $backendLog = Join-Path $env:TEMP 'ci_cd_back_uvicorn.log'
+$backendErrLog = Join-Path $env:TEMP 'ci_cd_back_uvicorn.err.log'
 
 try {
     $healthy = $false
@@ -47,7 +48,7 @@ try {
 
     if (-not $healthy) {
         Write-Host 'Starting backend server...'
-        $backendProcess = Start-Process -FilePath $pythonCmd -ArgumentList @('-m', 'uvicorn', 'app.main:app', '--host', '0.0.0.0', '--port', '8000') -PassThru -WindowStyle Hidden -RedirectStandardOutput $backendLog -RedirectStandardError $backendLog
+        $backendProcess = Start-Process -FilePath $pythonCmd -ArgumentList @('-m', 'uvicorn', 'app.main:app', '--host', '0.0.0.0', '--port', '8000') -PassThru -WindowStyle Hidden -RedirectStandardOutput $backendLog -RedirectStandardError $backendErrLog
         $backendStartedByScript = $true
 
         $started = $false
