@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import subprocess
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -23,18 +24,34 @@ def run_ci(repo_url: str, branch: str) -> tuple[str, list[str]]:
 
 def send_result(callback_url: str, callback_token: str, payload: dict) -> None:
     headers = {"x-callback-token": callback_token}
-    response = requests.post(callback_url, json=payload, headers=headers, timeout=20)
-    response.raise_for_status()
+    last_exc: Exception | None = None
+    for attempt in range(1, 6):
+        try:
+            response = requests.post(callback_url, json=payload, headers=headers, timeout=(3, 8))
+            response.raise_for_status()
+            return
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt == 5:
+                raise
+            time.sleep(min(2 ** (attempt - 1), 5))
+
+    if last_exc is not None:
+        raise last_exc
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--job-id", required=True)
-    parser.add_argument("--repo-url", required=True)
+    parser.add_argument("--repo-url", dest="repo_url")
+    parser.add_argument("--repo", dest="repo_url")
     parser.add_argument("--branch", default="main")
     parser.add_argument("--callback-url", required=True)
     parser.add_argument("--callback-token", required=True)
     args = parser.parse_args()
+
+    if not args.repo_url:
+        parser.error("one of --repo-url or --repo is required")
 
     started_at = datetime.now(timezone.utc)
     status, logs = run_ci(args.repo_url, args.branch)

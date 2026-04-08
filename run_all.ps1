@@ -7,6 +7,35 @@ $ErrorActionPreference = 'Stop'
 
 Set-Location -Path $PSScriptRoot
 
+function Load-DotEnv([string]$filePath) {
+    if (-not (Test-Path $filePath)) {
+        return
+    }
+
+    foreach ($line in (Get-Content -Path $filePath)) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed -or $trimmed.StartsWith('#')) {
+            continue
+        }
+
+        $idx = $trimmed.IndexOf('=')
+        if ($idx -lt 1) {
+            continue
+        }
+
+        $name = $trimmed.Substring(0, $idx).Trim()
+        $value = $trimmed.Substring($idx + 1).Trim()
+        if ($value.StartsWith('"') -and $value.EndsWith('"') -and $value.Length -ge 2) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+        if (-not (Get-Item -Path "Env:$name" -ErrorAction SilentlyContinue)) {
+            Set-Item -Path "Env:$name" -Value $value
+        }
+    }
+}
+
+Load-DotEnv (Join-Path $PSScriptRoot '.env')
+
 $pythonCmd = $null
 if (Test-Path '.venv/Scripts/python.exe') {
     $pythonCmd = (Resolve-Path '.venv/Scripts/python.exe').Path
@@ -28,7 +57,18 @@ if (-not $env:UBUNTU_PYTHON_COMMAND) { $env:UBUNTU_PYTHON_COMMAND = 'python3' }
 if (-not $env:UBUNTU_SHELL_PRELUDE) {
     $env:UBUNTU_SHELL_PRELUDE = 'export PATH="$HOME/.local/bin:$PATH" && export NVM_DIR="$HOME/.nvm" && source "$NVM_DIR/nvm.sh"'
 }
-if (-not $env:WINDOWS_CALLBACK_BASE_URL) { $env:WINDOWS_CALLBACK_BASE_URL = 'http://192.168.0.2:8000' }
+if (-not $env:WINDOWS_CALLBACK_BASE_URL) { $env:WINDOWS_CALLBACK_BASE_URL = 'http://192.168.0.2:8010' }
+
+$backendPort = 8010
+try {
+    $callbackUri = [Uri]$env:WINDOWS_CALLBACK_BASE_URL
+    if ($callbackUri.Port -gt 0) {
+        $backendPort = $callbackUri.Port
+    }
+} catch {
+}
+
+$backendLocalUrl = "http://127.0.0.1:$backendPort"
 
 $backendStartedByScript = $false
 $backendProcess = $null
@@ -38,7 +78,7 @@ $backendErrLog = Join-Path $env:TEMP 'ci_cd_back_uvicorn.err.log'
 try {
     $healthy = $false
     try {
-        $health = Invoke-RestMethod -Method Get -Uri 'http://127.0.0.1:8000/health' -TimeoutSec 3
+        $health = Invoke-RestMethod -Method Get -Uri "$backendLocalUrl/health" -TimeoutSec 3
         if ($health.status -eq 'ok') {
             $healthy = $true
         }
@@ -47,15 +87,15 @@ try {
     }
 
     if (-not $healthy) {
-        Write-Host 'Starting backend server...'
-        $backendProcess = Start-Process -FilePath $pythonCmd -ArgumentList @('-m', 'uvicorn', 'app.main:app', '--host', '0.0.0.0', '--port', '8000') -PassThru -WindowStyle Hidden -RedirectStandardOutput $backendLog -RedirectStandardError $backendErrLog
+        Write-Host "Starting backend server on 0.0.0.0:$backendPort ..."
+        $backendProcess = Start-Process -FilePath $pythonCmd -ArgumentList @('-m', 'uvicorn', 'app.main:app', '--host', '0.0.0.0', '--port', "$backendPort") -PassThru -WindowStyle Hidden -RedirectStandardOutput $backendLog -RedirectStandardError $backendErrLog
         $backendStartedByScript = $true
 
         $started = $false
         for ($i = 0; $i -lt 30; $i++) {
             Start-Sleep -Seconds 1
             try {
-                $health = Invoke-RestMethod -Method Get -Uri 'http://127.0.0.1:8000/health' -TimeoutSec 3
+                $health = Invoke-RestMethod -Method Get -Uri "$backendLocalUrl/health" -TimeoutSec 3
                 if ($health.status -eq 'ok') {
                     $started = $true
                     break
@@ -69,7 +109,7 @@ try {
             exit 1
         }
     } else {
-        Write-Host 'Backend server is already running.'
+        Write-Host "Backend server is already running on $backendLocalUrl."
     }
 
     $lastExitCode = 0
@@ -78,7 +118,19 @@ try {
     while ($continueLoop) {
         Write-Host ''
         Write-Host 'Launching repository input prompt.'
-        & $pythonCmd 'run_pipeline_prompt.py' @PromptArgs
+        $hasBackendUrl = $false
+        foreach ($arg in $PromptArgs) {
+            if ($arg -eq '--backend-url') {
+                $hasBackendUrl = $true
+                break
+            }
+        }
+
+        if ($hasBackendUrl) {
+            & $pythonCmd 'run_pipeline_prompt.py' @PromptArgs
+        } else {
+            & $pythonCmd 'run_pipeline_prompt.py' '--backend-url' $backendLocalUrl @PromptArgs
+        }
         $lastExitCode = $LASTEXITCODE
 
         Write-Host ''

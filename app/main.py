@@ -83,6 +83,19 @@ def receive_result(payload: PipelineResultPayload) -> dict[str, str]:
 def get_result(job_id: str = Query(..., min_length=1)) -> PipelineResultResponse:
     data = result_store.load(job_id)
     if data is None:
+        remote_data = result_fetcher.fetch_result_by_job_id(job_id=job_id)
+        if remote_data is not None:
+            result_store.save(job_id, remote_data)
+            existing = job_state.get(job_id, {})
+            existing.update(
+                {
+                    "status": remote_data.get("status", existing.get("status", "unknown")),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            job_state[job_id] = existing
+            return PipelineResultResponse(found=True, data=PipelineResultPayload(**remote_data), message="ok")
+
         return PipelineResultResponse(found=False, data=None, message="result not found yet")
 
     return PipelineResultResponse(found=True, data=PipelineResultPayload(**data), message="ok")

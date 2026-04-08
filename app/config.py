@@ -1,10 +1,20 @@
 from functools import lru_cache
+from pathlib import Path
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ENV_FILE_PATH = PROJECT_ROOT / ".env"
+
+
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=str(ENV_FILE_PATH),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     ubuntu_ssh_host: str = Field(default="10.0.0.10", alias="UBUNTU_SSH_HOST")
     ubuntu_ssh_port: int = Field(default=22, alias="UBUNTU_SSH_PORT")

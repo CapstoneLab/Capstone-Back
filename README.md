@@ -53,13 +53,13 @@ pip install -r requirements.txt
 ### 3) 서버 실행
 
 ```powershell
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8010
 ```
 
 ### 4) API 호출 예시
 
 ```powershell
-curl -X POST http://127.0.0.1:8000/start-pipeline `
+curl -X POST http://127.0.0.1:8010/start-pipeline `
   -H "Content-Type: application/json" `
   -d '{"repo_url":"https://github.com/owner/repo.git","branch":"main"}'
 ```
@@ -67,7 +67,7 @@ curl -X POST http://127.0.0.1:8000/start-pipeline `
 결과 조회:
 
 ```powershell
-curl "http://127.0.0.1:8000/get-results?job_id=<JOB_ID>"
+curl "http://127.0.0.1:8010/get-results?job_id=<JOB_ID>"
 ```
 
 ## 터미널 프롬프트 실행(레포 입력 자동화)
@@ -81,8 +81,10 @@ c:/Users/suhodang1/CI-CD-Back/.venv/Scripts/python.exe run_pipeline_prompt.py
 인자를 함께 주는 예시:
 
 ```powershell
-c:/Users/suhodang1/CI-CD-Back/.venv/Scripts/python.exe run_pipeline_prompt.py --repo https://github.com/moddak2/- --branch main --backend-url http://127.0.0.1:8000
+c:/Users/suhodang1/CI-CD-Back/.venv/Scripts/python.exe run_pipeline_prompt.py --repo https://github.com/moddak2/- --branch main --backend-url http://127.0.0.1:8010
 ```
+
+주의: 클라이언트에서 `--backend-url http://0.0.0.0:8010` 형태는 사용하지 마세요. 로컬 호출은 `http://127.0.0.1:8010`를 사용해야 안정적으로 동작합니다.
 
 기본값은 로그 전체를 출력합니다. 마지막 N줄만 보고 싶으면 `--tail-lines`를 사용합니다.
 

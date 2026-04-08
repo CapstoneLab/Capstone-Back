@@ -16,6 +16,7 @@ class TriggerService:
 
     def _trigger_ssh(self, *, job_id: str, repo_url: str, branch: str) -> None:
         remote_cmd = self._build_remote_command(job_id=job_id, repo_url=repo_url, branch=branch)
+        print(f"[DEBUG] SSH connecting to {self.settings.ubuntu_ssh_host}:{self.settings.ubuntu_ssh_port} as {self.settings.ubuntu_ssh_user}")
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(
@@ -28,9 +29,17 @@ class TriggerService:
             allow_agent=False,
         )
 
-        bg_cmd = f"nohup bash -lc {shlex.quote(remote_cmd)} >/tmp/ci_runner_{job_id}.log 2>&1 &"
-        ssh.exec_command(f"bash -lc {shlex.quote(bg_cmd)}")
-        ssh.close()
+        log_file = f"/tmp/ci_runner_{job_id}.log"
+        bg_cmd = (
+            f"setsid nohup bash -lc {shlex.quote(remote_cmd)} "
+            f">{shlex.quote(log_file)} 2>&1 </dev/null &"
+        )
+
+        try:
+            _, stdout, _ = ssh.exec_command(bg_cmd, timeout=10)
+            stdout.channel.recv_exit_status()
+        finally:
+            ssh.close()
 
     def _build_remote_command(self, *, job_id: str, repo_url: str, branch: str) -> str:
         callback_url = f"{self.settings.windows_callback_base_url}/get-results"
@@ -80,6 +89,20 @@ class UbuntuResultFetcher:
     def __init__(self) -> None:
         self.settings = get_settings()
 
+    def _connect_ssh(self) -> paramiko.SSHClient:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(
+            hostname=self.settings.ubuntu_ssh_host,
+            port=self.settings.ubuntu_ssh_port,
+            username=self.settings.ubuntu_ssh_user,
+            password=self.settings.ubuntu_ssh_password,
+            timeout=5,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+        return ssh
+
     def fetch_steps(self, run_id: str) -> list[dict] | None:
         if not run_id:
             return None
@@ -91,17 +114,7 @@ class UbuntuResultFetcher:
         remote_path = f"{working_dir.rstrip('/')}/runs/{run_id}/pipeline_result.json"
 
         try:
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(
-                hostname=self.settings.ubuntu_ssh_host,
-                port=self.settings.ubuntu_ssh_port,
-                username=self.settings.ubuntu_ssh_user,
-                password=self.settings.ubuntu_ssh_password,
-                timeout=5,
-                look_for_keys=False,
-                allow_agent=False,
-            )
+            ssh = self._connect_ssh()
 
             sftp = ssh.open_sftp()
             with sftp.open(remote_path, "r") as fp:
@@ -116,6 +129,63 @@ class UbuntuResultFetcher:
             steps = obj.get("steps")
             if isinstance(steps, list):
                 return [x for x in steps if isinstance(x, dict)]
+            return None
+        except Exception:
+            return None
+
+    def fetch_result_by_job_id(self, job_id: str, scan_limit: int = 60) -> dict | None:
+        if not job_id:
+            return None
+
+        working_dir = self.settings.ubuntu_working_dir.strip()
+        if not working_dir:
+            return None
+
+        runs_dir = f"{working_dir.rstrip('/')}/runs"
+
+        try:
+            ssh = self._connect_ssh()
+            sftp = ssh.open_sftp()
+
+            try:
+                entries = sftp.listdir_attr(runs_dir)
+            except Exception:
+                sftp.close()
+                ssh.close()
+                return None
+
+            entries_sorted = sorted(entries, key=lambda x: x.st_mtime, reverse=True)
+            for entry in entries_sorted[:scan_limit]:
+                run_id = entry.filename
+                remote_path = f"{runs_dir}/{run_id}/pipeline_result.json"
+
+                try:
+                    with sftp.open(remote_path, "r") as fp:
+                        raw = fp.read()
+                except Exception:
+                    continue
+
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", "replace")
+
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    continue
+
+                metadata = obj.get("metadata")
+                if not isinstance(metadata, dict):
+                    continue
+
+                if str(metadata.get("job_id", "")).strip() != job_id:
+                    continue
+
+                sftp.close()
+                ssh.close()
+                return obj if isinstance(obj, dict) else None
+
+            sftp.close()
+            ssh.close()
             return None
         except Exception:
             return None

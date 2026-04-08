@@ -4,8 +4,20 @@ import os
 import re
 import sys
 import time
+from urllib.parse import urlparse, urlunparse
 
 import requests
+
+
+def normalize_backend_url(raw_url: str) -> str:
+    text = raw_url.strip().rstrip("/")
+    parsed = urlparse(text)
+    if parsed.scheme and parsed.hostname == "0.0.0.0":
+        fixed_netloc = parsed.netloc.replace("0.0.0.0", "127.0.0.1", 1)
+        fixed_url = urlunparse(parsed._replace(netloc=fixed_netloc)).rstrip("/")
+        print(f"[info] backend-url 0.0.0.0 -> {fixed_url} 로 보정하여 요청합니다.")
+        return fixed_url
+    return text
 
 
 def parse_args() -> argparse.Namespace:
@@ -13,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repo", default="", help="GitHub repository URL")
     parser.add_argument("--branch", default="main", help="Git branch")
     parser.add_argument("--backend-url", default="http://127.0.0.1:8000", help="Windows backend URL")
-    parser.add_argument("--poll-interval", type=int, default=3, help="Polling interval in seconds")
+    parser.add_argument("--poll-interval", type=int, default=1, help="Polling interval in seconds")
     parser.add_argument(
         "--tail-lines",
         type=int,
@@ -112,9 +124,14 @@ def _print_pipeline_result_summary(data: dict, metadata: dict) -> None:
     if exact_steps is not None:
         has_skipped = False
         for step in exact_steps:
-            step_name = step.get("step_name", "unknown")
+            step_name = (
+                step.get("step_name")
+                or step.get("name")
+                or step.get("step")
+                or "unknown"
+            )
             step_status = step.get("status", "unknown")
-            summary = step.get("summary_message") or "no message"
+            summary = step.get("summary_message") or step.get("summary") or "no message"
             if step_status == "skipped":
                 has_skipped = True
             print(f"- {step_name}: {step_status} ({summary})")
@@ -238,14 +255,15 @@ def main() -> int:
     try:
         args = parse_args()
         repo = ask_repo_if_needed(args.repo)
+        backend_base_url = normalize_backend_url(args.backend_url)
 
         print("파이프라인 시작 요청 중...")
-        job_id = start_pipeline(args.backend_url.rstrip("/"), repo, args.branch)
+        job_id = start_pipeline(backend_base_url, repo, args.branch)
         print("job_id:", job_id)
 
         print("우분투에서 파이프라인이 실행 중입니다. 결과를 기다리는 중...")
         result = poll_results(
-            base_url=args.backend_url.rstrip("/"),
+            base_url=backend_base_url,
             job_id=job_id,
             poll_interval=args.poll_interval,
         )
