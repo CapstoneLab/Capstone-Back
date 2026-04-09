@@ -11,29 +11,50 @@ APP_DIR="/opt/deployments/apps/${OWNER}/${REPO}"
 HASH_FILE="${APP_DIR}/.deploy_hash"
 MANIFEST_FILE="${APP_DIR}/deploy_manifest.json"
 
-# Check duplicate deploy
+# ── Check duplicate deploy ──
 if [ -f "$HASH_FILE" ] && [ "$(cat "$HASH_FILE")" = "$HASH" ]; then
   echo "SKIP: Artifact hash unchanged"
   exit 0
 fi
 
-# Prepare directory
+# ── Prepare directory ──
 mkdir -p "$APP_DIR"
+mkdir -p /opt/deployments/nginx
+mkdir -p /opt/deployments/www
 
-# Download artifact from S3
+# ── Download artifact from S3 ──
 aws s3 cp "s3://${S3_BUCKET}/${S3_KEY}/deploy.tar.gz" "/tmp/deploy_${OWNER}_${REPO}.tar.gz"
 
-# Extract
+# ── Extract ──
 rm -rf "${APP_DIR}/source"
 mkdir -p "${APP_DIR}/source"
 tar xzf "/tmp/deploy_${OWNER}_${REPO}.tar.gz" -C "${APP_DIR}/source"
 rm -f "/tmp/deploy_${OWNER}_${REPO}.tar.gz"
 
-# Install Python dependencies
+# ── Detect runtime ──
 cd "${APP_DIR}/source"
-python3 -m pip install -r requirements.txt --quiet 2>/dev/null || true
+RUNTIME="unknown"
+if [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
+  RUNTIME="python"
+elif [ -f "package.json" ]; then
+  RUNTIME="node"
+elif [ -f "pom.xml" ] || [ -f "build.gradle" ]; then
+  RUNTIME="java"
+fi
 
-# Assign port (base 9000 + offset)
+# ── Install dependencies ──
+if [ "$RUNTIME" = "python" ]; then
+  # Use python3.11 (python3 on AL2023 is 3.9 which may be too old)
+  PYTHON_BIN="python3.11"
+  if ! command -v "$PYTHON_BIN" &>/dev/null; then
+    PYTHON_BIN="python3"
+  fi
+  $PYTHON_BIN -m pip install -r requirements.txt --quiet 2>/dev/null || true
+elif [ "$RUNTIME" = "node" ]; then
+  npm install --omit=dev 2>/dev/null || true
+fi
+
+# ── Assign port ──
 PORT_REGISTRY="/opt/deployments/.port_registry"
 touch "$PORT_REGISTRY"
 EXISTING_PORT=$(grep "^${OWNER}/${REPO} " "$PORT_REGISTRY" | awk '{print $2}' || true)
@@ -48,37 +69,105 @@ else
   PORT=$EXISTING_PORT
 fi
 
-# Start/restart with PM2
+# ── Stop existing process ──
 PM2_HOME=/etc/.pm2
 export PM2_HOME
 PM2_NAME="${OWNER}--${REPO}"
-
 pm2 delete "$PM2_NAME" 2>/dev/null || true
-cd "${APP_DIR}/source"
-pm2 start "uvicorn app.main:app --host 0.0.0.0 --port ${PORT}" \
-  --name "$PM2_NAME" \
-  --interpreter none \
-  -- --no-autorestart
-pm2 save
 
-# Configure Nginx reverse proxy
+# Also kill any leftover uvicorn/gunicorn on this port
+fuser -k ${PORT}/tcp 2>/dev/null || true
+sleep 1
+
+# ── Start application ──
+cd "${APP_DIR}/source"
+
+if [ "$RUNTIME" = "python" ]; then
+  PYTHON_BIN="python3.11"
+  if ! command -v "$PYTHON_BIN" &>/dev/null; then
+    PYTHON_BIN="python3"
+  fi
+
+  # Detect FastAPI (uvicorn) vs Flask/Django (gunicorn)
+  if grep -q "fastapi\|FastAPI" requirements.txt 2>/dev/null || grep -q "uvicorn" requirements.txt 2>/dev/null; then
+    # FastAPI → uvicorn
+    # Find the app module (app.main:app, main:app, etc.)
+    APP_MODULE="app.main:app"
+    if [ -f "main.py" ] && ! [ -d "app" ]; then
+      APP_MODULE="main:app"
+    fi
+    pm2 start "$PYTHON_BIN -m uvicorn ${APP_MODULE} --host 0.0.0.0 --port ${PORT}" \
+      --name "$PM2_NAME" \
+      --interpreter none
+  else
+    # Flask/Django → gunicorn
+    WSGI_APP="app:app"
+    for f in app.py main.py wsgi.py application.py; do
+      if [ -f "$f" ]; then
+        WSGI_APP="$(basename "$f" .py):app"
+        break
+      fi
+    done
+    pm2 start "$PYTHON_BIN -m gunicorn ${WSGI_APP} -b 0.0.0.0:${PORT}" \
+      --name "$PM2_NAME" \
+      --interpreter none
+  fi
+
+elif [ "$RUNTIME" = "node" ]; then
+  ENTRY=""
+  for f in server.js index.js app.js main.js; do
+    [ -f "$f" ] && ENTRY="$f" && break
+  done
+  if [ -n "$ENTRY" ]; then
+    PORT=$PORT pm2 start "$ENTRY" --name "$PM2_NAME"
+  fi
+
+elif [ "$RUNTIME" = "java" ]; then
+  JAR=$(find . -name "*.jar" -type f | head -1)
+  if [ -n "$JAR" ]; then
+    pm2 start "java -jar ${JAR} --server.port=${PORT}" \
+      --name "$PM2_NAME" \
+      --interpreter none
+  fi
+fi
+
+pm2 save 2>/dev/null || true
+
+# ── Wait for app to start and verify ──
+sleep 3
+ACTUAL_PORT=""
+if [ "$RUNTIME" = "python" ] || [ "$RUNTIME" = "node" ]; then
+  ACTUAL_PORT=$(ss -tlnp 2>/dev/null | grep "$PM2_NAME\|python\|node" | grep -oP ':\K[0-9]+(?=\s)' | sort -n | tail -1 || true)
+  if [ -n "$ACTUAL_PORT" ] && [ "$ACTUAL_PORT" != "$PORT" ]; then
+    echo "App listening on port $ACTUAL_PORT instead of $PORT, adjusting..."
+    sed -i "s|^${OWNER}/${REPO} .*|${OWNER}/${REPO} ${ACTUAL_PORT}|" "$PORT_REGISTRY"
+    PORT=$ACTUAL_PORT
+  fi
+fi
+
+# ── Configure Nginx reverse proxy ──
 NGINX_CONF="/opt/deployments/nginx/${OWNER}__${REPO}.conf"
-mkdir -p /opt/deployments/nginx
 
 cat > "$NGINX_CONF" <<NGINX
+location /${OWNER}/${REPO} {
+    return 301 /${OWNER}/${REPO}/;
+}
 location /${OWNER}/${REPO}/ {
     proxy_pass http://127.0.0.1:${PORT}/;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection 'upgrade';
     proxy_set_header Host \$host;
     proxy_set_header X-Real-IP \$remote_addr;
     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_cache_bypass \$http_upgrade;
 }
 NGINX
 
-# Reload Nginx
 nginx -t && systemctl reload nginx
 
-# Save deploy hash & manifest
+# ── Save deploy hash & manifest ──
 echo "$HASH" > "$HASH_FILE"
 cat > "$MANIFEST_FILE" <<MANIFEST
 {
@@ -86,12 +175,98 @@ cat > "$MANIFEST_FILE" <<MANIFEST
   "repo": "${REPO}",
   "hash": "${HASH}",
   "port": ${PORT},
-  "runtime": "python",
+  "runtime": "${RUNTIME}",
   "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 MANIFEST
 
-# Update dashboard
-/opt/deployments/update_dashboard.sh 2>/dev/null || true
+# ── Update dashboard index page ──
+INDEX_FILE="/opt/deployments/www/index.html"
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || true)
+SERVER_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo "unknown")
 
-echo "SUCCESS: Deployed ${OWNER}/${REPO} on port ${PORT}"
+APP_COUNT=0
+TABLE_ROWS=""
+
+while IFS=' ' read -r APP_PATH APP_PORT; do
+  [ -z "$APP_PATH" ] && continue
+  APP_COUNT=$((APP_COUNT + 1))
+  APP_OWNER=$(echo "$APP_PATH" | cut -d'/' -f1)
+  APP_REPO=$(echo "$APP_PATH" | cut -d'/' -f2-)
+  APP_DIR_CHECK="/opt/deployments/apps/$APP_PATH"
+
+  M_RUNTIME=$(cat "$APP_DIR_CHECK/deploy_manifest.json" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('runtime','node'))" 2>/dev/null || echo "node")
+  case "$M_RUNTIME" in
+    react)    BADGE_CLASS="badge-react";   BADGE_TEXT="React" ;;
+    vue)      BADGE_CLASS="badge-vue";     BADGE_TEXT="Vue" ;;
+    angular)  BADGE_CLASS="badge-angular"; BADGE_TEXT="Angular" ;;
+    nextjs)   BADGE_CLASS="badge-next";    BADGE_TEXT="Next.js" ;;
+    python)   BADGE_CLASS="badge-python";  BADGE_TEXT="Python" ;;
+    java)     BADGE_CLASS="badge-java";    BADGE_TEXT="Java" ;;
+    node)     BADGE_CLASS="badge-node";    BADGE_TEXT="Node.js" ;;
+    *)        BADGE_CLASS="badge-static";  BADGE_TEXT="Static" ;;
+  esac
+
+  STATUS_DOT="🟢"
+  if ! ss -tlnp 2>/dev/null | grep -q ":${APP_PORT} "; then
+    STATUS_DOT="🔴"
+  fi
+
+  TABLE_ROWS="${TABLE_ROWS}<tr><td>${STATUS_DOT} <a href=\"/${APP_PATH}/\">${APP_OWNER}/${APP_REPO}</a></td><td><span class=\"badge ${BADGE_CLASS}\">${BADGE_TEXT}</span></td><td class=\"port\">:${APP_PORT}</td><td><a href=\"/${APP_PATH}/\">/${APP_PATH}/</a></td></tr>"
+done < "$PORT_REGISTRY"
+
+cat > "$INDEX_FILE" <<HTMLEOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CI/CD Deploy Server</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+  .container{max-width:900px;margin:0 auto;padding:40px 20px}
+  h1{font-size:2rem;font-weight:700;margin-bottom:8px;color:#f8fafc}
+  .subtitle{color:#94a3b8;margin-bottom:32px;font-size:.95rem}
+  .stats{display:flex;gap:16px;margin-bottom:32px}
+  .stat-card{background:#1e293b;border-radius:12px;padding:16px 24px;flex:1;border:1px solid #334155}
+  .stat-value{font-size:1.5rem;font-weight:700;color:#38bdf8}
+  .stat-label{font-size:.8rem;color:#94a3b8;margin-top:4px}
+  table{width:100%;border-collapse:collapse;background:#1e293b;border-radius:12px;overflow:hidden;border:1px solid #334155}
+  th{background:#334155;padding:14px 20px;text-align:left;font-size:.8rem;text-transform:uppercase;letter-spacing:.05em;color:#94a3b8;font-weight:600}
+  td{padding:14px 20px;border-top:1px solid #334155}
+  tr:hover td{background:#263348}
+  a{color:#38bdf8;text-decoration:none;font-weight:500}
+  a:hover{text-decoration:underline;color:#7dd3fc}
+  .badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:.75rem;font-weight:600}
+  .badge-node{background:#064e3b;color:#6ee7b7}
+  .badge-react{background:#164e63;color:#67e8f9}
+  .badge-vue{background:#14532d;color:#86efac}
+  .badge-angular{background:#7f1d1d;color:#fca5a5}
+  .badge-next{background:#1c1917;color:#e7e5e4;border:1px solid #44403c}
+  .badge-python{background:#1e3a5f;color:#93c5fd}
+  .badge-java{background:#7c2d12;color:#fdba74}
+  .badge-static{background:#3f3f46;color:#d4d4d8}
+  .port{font-family:'SF Mono','Fira Code',monospace;color:#a78bfa;font-size:.9rem}
+  .footer{margin-top:32px;text-align:center;color:#475569;font-size:.8rem}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>CI/CD Deploy Server</h1>
+<p class="subtitle">Deployed applications via Local CI Engine</p>
+<div class="stats">
+  <div class="stat-card"><div class="stat-value">${APP_COUNT}</div><div class="stat-label">Deployed Apps</div></div>
+  <div class="stat-card"><div class="stat-value">${SERVER_IP}</div><div class="stat-label">Server IP</div></div>
+</div>
+<table>
+  <thead><tr><th>Application</th><th>Runtime</th><th>Port</th><th>URL</th></tr></thead>
+  <tbody>${TABLE_ROWS}</tbody>
+</table>
+<div class="footer">Powered by Local CI Engine</div>
+</div>
+</body>
+</html>
+HTMLEOF
+
+echo "SUCCESS: Deployed ${OWNER}/${REPO} on port ${PORT} (runtime: ${RUNTIME})"
