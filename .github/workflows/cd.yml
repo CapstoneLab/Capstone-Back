@@ -1,0 +1,244 @@
+name: CD
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+env:
+  APP_NAME: ci-cd-back
+
+jobs:
+  deploy:
+    name: Deploy to AWS EC2
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Prepare artifact
+        id: artifact
+        run: |
+          DEPLOY_HASH=$(find . -type f \
+            -not -path './.git/*' \
+            -not -path './.venv/*' \
+            -not -path './__pycache__/*' \
+            -not -path './results/*' \
+            -not -path './.env' \
+            | sort | xargs sha256sum | sha256sum | cut -d' ' -f1)
+          echo "hash=${DEPLOY_HASH}" >> "$GITHUB_OUTPUT"
+
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+          echo "owner=${OWNER}" >> "$GITHUB_OUTPUT"
+          echo "repo=${REPO}" >> "$GITHUB_OUTPUT"
+          echo "s3_key=deployments/${OWNER}/${REPO}/${DEPLOY_HASH}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact to S3
+        run: |
+          tar czf /tmp/deploy.tar.gz \
+            --exclude='.git' \
+            --exclude='.venv' \
+            --exclude='__pycache__' \
+            --exclude='results' \
+            --exclude='.env' \
+            .
+          aws s3 cp /tmp/deploy.tar.gz \
+            "s3://${{ secrets.S3_BUCKET }}/${{ steps.artifact.outputs.s3_key }}/deploy.tar.gz"
+
+      - name: Deploy to EC2 via SSM
+        id: deploy
+        run: |
+          OWNER="${{ steps.artifact.outputs.owner }}"
+          REPO="${{ steps.artifact.outputs.repo }}"
+          HASH="${{ steps.artifact.outputs.hash }}"
+          S3_KEY="${{ steps.artifact.outputs.s3_key }}"
+          S3_BUCKET="${{ secrets.S3_BUCKET }}"
+
+          DEPLOY_SCRIPT=$(cat <<'SCRIPT'
+          set -e
+
+          OWNER="__OWNER__"
+          REPO="__REPO__"
+          HASH="__HASH__"
+          S3_BUCKET="__S3_BUCKET__"
+          S3_KEY="__S3_KEY__"
+
+          APP_DIR="/opt/deployments/apps/${OWNER}/${REPO}"
+          HASH_FILE="${APP_DIR}/.deploy_hash"
+          MANIFEST_FILE="${APP_DIR}/deploy_manifest.json"
+
+          # Check duplicate deploy
+          if [ -f "$HASH_FILE" ] && [ "$(cat "$HASH_FILE")" = "$HASH" ]; then
+            echo "SKIP: Artifact hash unchanged"
+            exit 0
+          fi
+
+          # Prepare directory
+          mkdir -p "$APP_DIR"
+
+          # Download artifact from S3
+          aws s3 cp "s3://${S3_BUCKET}/${S3_KEY}/deploy.tar.gz" /tmp/deploy_${OWNER}_${REPO}.tar.gz
+
+          # Extract
+          rm -rf "${APP_DIR}/source"
+          mkdir -p "${APP_DIR}/source"
+          tar xzf /tmp/deploy_${OWNER}_${REPO}.tar.gz -C "${APP_DIR}/source"
+          rm -f /tmp/deploy_${OWNER}_${REPO}.tar.gz
+
+          # Install Python dependencies
+          cd "${APP_DIR}/source"
+          python3 -m pip install -r requirements.txt --quiet 2>/dev/null || true
+
+          # Assign port (base 9000 + offset)
+          PORT_REGISTRY="/opt/deployments/.port_registry"
+          touch "$PORT_REGISTRY"
+          EXISTING_PORT=$(grep "^${OWNER}/${REPO} " "$PORT_REGISTRY" | awk '{print $2}' || true)
+
+          if [ -z "$EXISTING_PORT" ]; then
+            MAX_PORT=$(awk '{print $2}' "$PORT_REGISTRY" | sort -n | tail -1 || echo 8999)
+            NEW_PORT=$((MAX_PORT + 1))
+            [ "$NEW_PORT" -lt 9000 ] && NEW_PORT=9000
+            echo "${OWNER}/${REPO} ${NEW_PORT}" >> "$PORT_REGISTRY"
+            PORT=$NEW_PORT
+          else
+            PORT=$EXISTING_PORT
+          fi
+
+          # Start/restart with PM2
+          PM2_HOME=/etc/.pm2
+          export PM2_HOME
+          PM2_NAME="${OWNER}--${REPO}"
+
+          pm2 delete "$PM2_NAME" 2>/dev/null || true
+          cd "${APP_DIR}/source"
+          pm2 start "uvicorn app.main:app --host 0.0.0.0 --port ${PORT}" \
+            --name "$PM2_NAME" \
+            --interpreter none \
+            -- --no-autorestart
+          pm2 save
+
+          # Configure Nginx reverse proxy
+          NGINX_CONF="/opt/deployments/nginx/${OWNER}__${REPO}.conf"
+          mkdir -p /opt/deployments/nginx
+
+          cat > "$NGINX_CONF" <<NGINX
+          location /${OWNER}/${REPO}/ {
+              proxy_pass http://127.0.0.1:${PORT}/;
+              proxy_set_header Host \$host;
+              proxy_set_header X-Real-IP \$remote_addr;
+              proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto \$scheme;
+          }
+          NGINX
+
+          # Reload Nginx
+          nginx -t && systemctl reload nginx
+
+          # Save deploy hash & manifest
+          echo "$HASH" > "$HASH_FILE"
+          cat > "$MANIFEST_FILE" <<MANIFEST
+          {
+            "owner": "${OWNER}",
+            "repo": "${REPO}",
+            "hash": "${HASH}",
+            "port": ${PORT},
+            "runtime": "python",
+            "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          MANIFEST
+
+          # Update dashboard
+          /opt/deployments/update_dashboard.sh 2>/dev/null || true
+
+          echo "SUCCESS: Deployed ${OWNER}/${REPO} on port ${PORT}"
+          SCRIPT
+
+          # Replace placeholders
+          DEPLOY_SCRIPT="${DEPLOY_SCRIPT//__OWNER__/$OWNER}"
+          DEPLOY_SCRIPT="${DEPLOY_SCRIPT//__REPO__/$REPO}"
+          DEPLOY_SCRIPT="${DEPLOY_SCRIPT//__HASH__/$HASH}"
+          DEPLOY_SCRIPT="${DEPLOY_SCRIPT//__S3_BUCKET__/$S3_BUCKET}"
+          DEPLOY_SCRIPT="${DEPLOY_SCRIPT//__S3_KEY__/$S3_KEY}"
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "commands=[$(echo "$DEPLOY_SCRIPT" | jq -Rs .)]" \
+            --timeout-seconds 300 \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: ${COMMAND_ID}"
+          echo "command_id=${COMMAND_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for deployment
+        run: |
+          COMMAND_ID="${{ steps.deploy.outputs.command_id }}"
+          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+
+          echo "Waiting for SSM command ${COMMAND_ID}..."
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query "Status" \
+              --output text 2>/dev/null || echo "InProgress")
+
+            if [ "$STATUS" = "Success" ]; then
+              echo "Deployment successful!"
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --query "StandardOutputContent" \
+                --output text
+              exit 0
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ] || [ "$STATUS" = "Cancelled" ]; then
+              echo "Deployment failed with status: ${STATUS}"
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --query "StandardErrorContent" \
+                --output text
+              exit 1
+            fi
+
+            echo "Status: ${STATUS} (attempt ${i}/30)"
+            sleep 10
+          done
+
+          echo "Timed out waiting for deployment"
+          exit 1
+
+      - name: Verify deployment
+        if: success()
+        run: |
+          OWNER="${{ steps.artifact.outputs.owner }}"
+          REPO="${{ steps.artifact.outputs.repo }}"
+          URL="http://44.199.215.211/${OWNER}/${REPO}/health"
+
+          echo "Checking ${URL}..."
+          for i in $(seq 1 5); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL" 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Health check passed!"
+              exit 0
+            fi
+            echo "Attempt ${i}/5 - HTTP ${HTTP_CODE}"
+            sleep 5
+          done
+
+          echo "WARNING: Health check did not return 200, but deployment may still be starting"
