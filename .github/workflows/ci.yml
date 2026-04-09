@@ -23,6 +23,8 @@ jobs:
 
       - name: Run tests
         run: pytest tests/ -v --tb=short
+        env:
+          PYTHONPATH: .
 
   build:
     name: Build
@@ -40,5 +42,6 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Verify app starts
-        run: |
-          timeout 5 python -c "from app.main import app; print('Build OK')" || true
+        run: python -c "from app.main import app; print('Build OK')"
+        env:
+          PYTHONPATH: .
