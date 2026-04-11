@@ -1,6 +1,8 @@
 import secrets
+import tempfile
 
 from html import escape
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -14,9 +16,12 @@ from app.auth.github_oauth import (
     fetch_github_user,
 )
 from app.auth.jwt_utils import create_access_token, get_current_user
+from app.auth.token_store import put_token
 from app.config import get_settings
 from app.db import get_db
 from app.db_models import User
+
+JWT_TEMP_FILE = Path(tempfile.gettempdir()) / "cicd_last_jwt.txt"
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 settings = get_settings()
@@ -54,6 +59,7 @@ async def github_callback(
     access_token = await exchange_code_for_token(code)
     profile = await fetch_github_user(access_token)
     encrypted = encrypt_token(access_token)
+    put_token(profile["github_id"], access_token)
 
     persisted_user_id: int | None = None
     try:
@@ -94,6 +100,11 @@ async def github_callback(
         github_id=profile["github_id"],
         profile=profile,
     )
+
+    try:
+        JWT_TEMP_FILE.write_text(jwt_token, encoding="utf-8")
+    except Exception as exc:
+        print(f"[auth] failed to write JWT temp file: {exc}")
 
     redirect_target = f"{settings.frontend_redirect_url}?token={jwt_token}"
     resp = RedirectResponse(url=redirect_target, status_code=302)
