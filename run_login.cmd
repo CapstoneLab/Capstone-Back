@@ -58,29 +58,69 @@ set HOST=127.0.0.1
 set PORT=8000
 if not "%~1"=="" set PORT=%~1
 
-REM ----- kill anything already listening on that port -----
-echo [run_login] Checking for stale process on port %PORT% ...
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr /r /c:":%PORT% .*LISTENING"') do (
-    echo [run_login] Killing stale PID %%a on port %PORT%
-    taskkill /F /PID %%a >nul 2>&1
-)
+REM ----- kill anything holding the port and any orphan uvicorn workers -----
+echo [run_login] Cleaning stale processes on port %PORT% ...
+powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\kill_orphans.ps1" -Port %PORT%
 
 REM ----- clear python bytecode cache to avoid stale .pyc -----
 if exist "app\__pycache__" rmdir /s /q "app\__pycache__" >nul 2>&1
 if exist "app\auth\__pycache__" rmdir /s /q "app\auth\__pycache__" >nul 2>&1
+if exist "app\api\__pycache__" rmdir /s /q "app\api\__pycache__" >nul 2>&1
+
+REM ----- remove any stale JWT temp file so the CLI only picks up a fresh one -----
+if exist "%TEMP%\cicd_last_jwt.txt" del /q "%TEMP%\cicd_last_jwt.txt" >nul 2>&1
 
 echo [run_login] Server       : http://%HOST%:%PORT%
 echo [run_login] Swagger docs : http://%HOST%:%PORT%/docs
 echo [run_login] GitHub login : http://%HOST%:%PORT%/auth/github/login
 echo.
-echo [run_login] Browser will open in 5s. Press Ctrl+C to stop the server.
+
+REM ========= 5. start uvicorn in the BACKGROUND (no extra window) =========
+REM   - output goes to server.log so it doesn't clobber the CLI
+REM   - --reload OFF in single-window mode (reloader spawns orphan workers on Windows)
+if exist "server.log" del /q "server.log" >nul 2>&1
+echo [run_login] Starting server in background (logs -^> server.log) ...
+start /B "" cmd /c ""%PY%" -m uvicorn app.main:app --host %HOST% --port %PORT% > server.log 2>&1"
+
+REM ========= 6. wait for /health to come up =========
+echo [run_login] Waiting for server to become ready ...
+set /a TRIES=0
+:WAIT_LOOP
+set /a TRIES+=1
+"%PY%" -c "import urllib.request,sys; urllib.request.urlopen('http://%HOST%:%PORT%/health',timeout=1); sys.exit(0)" >nul 2>&1
+if not errorlevel 1 goto SERVER_READY
+if %TRIES% GEQ 30 (
+    echo [run_login] Server did not become ready in time.
+    echo [run_login] ----- last lines of server.log -----
+    if exist "server.log" powershell -NoProfile -Command "Get-Content -Path 'server.log' -Tail 30"
+    echo [run_login] -------------------------------------
+    pause
+    exit /b 1
+)
+"%PY%" -c "import time; time.sleep(0.5)" >nul 2>&1
+goto WAIT_LOOP
+
+:SERVER_READY
+echo [run_login] Server is up.
+
+REM ========= 7. open browser to /auth/github/login =========
+start "" "http://%HOST%:%PORT%/auth/github/login"
+
+REM ========= 8. run interactive repo/branch selector in THIS window =========
 echo.
-
-REM ========= 5. auto-open browser after 5s =========
-start "" /min powershell -NoProfile -Command "Start-Sleep -Seconds 5; Start-Process 'http://%HOST%:%PORT%/auth/github/login'"
-
-REM ========= 6. run uvicorn in foreground (logs visible, Ctrl+C stops) =========
-"%PY%" -m uvicorn app.main:app --host %HOST% --port %PORT% --reload
+echo [run_login] Launching interactive repo/branch selector ...
+echo.
+"%PY%" select_repo.py --base "http://%HOST%:%PORT%"
 set EXIT_CODE=%ERRORLEVEL%
+
+REM ========= 9. stop the background server =========
+echo.
+echo [run_login] Stopping background server on port %PORT% ...
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr /r /c:":%PORT% .*LISTENING"') do (
+    taskkill /F /PID %%a >nul 2>&1
+)
+echo [run_login] Done. Server log is in server.log
+echo.
+pause
 
 endlocal & exit /b %EXIT_CODE%

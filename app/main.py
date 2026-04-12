@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query
 
+from app.api.repos_router import router as repos_router
 from app.auth.router import router as auth_router
 from app.db import Base, engine
 from app.db_models import User  # noqa: F401  (ensures table is registered)
@@ -32,6 +33,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Windows CI Trigger Backend", version="1.0.0", lifespan=lifespan)
 app.include_router(auth_router)
+app.include_router(repos_router)
 
 trigger_service = TriggerService()
 result_store = ResultStore()
