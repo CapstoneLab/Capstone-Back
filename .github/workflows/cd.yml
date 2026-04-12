@@ -124,7 +124,7 @@ jobs:
         run: |
           OWNER="${{ steps.artifact.outputs.owner }}"
           REPO="${{ steps.artifact.outputs.repo }}"
-          URL="http://44.199.215.211/${OWNER}/${REPO}/health"
+          URL="http://ec2-54-221-222-244.compute-1.amazonaws.com/${OWNER}/${REPO}/health"
 
           echo "Checking ${URL}..."
           for i in $(seq 1 5); do
