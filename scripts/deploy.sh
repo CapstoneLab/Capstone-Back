@@ -96,7 +96,7 @@ if [ "$RUNTIME" = "python" ]; then
     if [ -f "main.py" ] && ! [ -d "app" ]; then
       APP_MODULE="main:app"
     fi
-    pm2 start "$PYTHON_BIN -m uvicorn ${APP_MODULE} --host 0.0.0.0 --port ${PORT}" \
+    pm2 start "$PYTHON_BIN -m uvicorn ${APP_MODULE} --host 0.0.0.0 --port ${PORT} --root-path /${OWNER}/${REPO}" \
       --name "$PM2_NAME" \
       --interpreter none
   else
