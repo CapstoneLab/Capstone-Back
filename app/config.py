@@ -37,6 +37,30 @@ class Settings(BaseSettings):
     )
     results_dir: str = Field(default="results", alias="RESULTS_DIR")
 
+    database_url: str = Field(
+        default="postgresql+asyncpg://ciuser:cipass@localhost:5432/cidb",
+        alias="DATABASE_URL",
+    )
+
+    github_client_id: str = Field(default="", alias="GITHUB_CLIENT_ID")
+    github_client_secret: str = Field(default="", alias="GITHUB_CLIENT_SECRET")
+    github_redirect_uri: str = Field(
+        default="http://127.0.0.1:8000/auth/github/callback",
+        alias="GITHUB_REDIRECT_URI",
+    )
+    github_oauth_scopes: str = Field(
+        default="read:user user:email repo", alias="GITHUB_OAUTH_SCOPES"
+    )
+    frontend_redirect_url: str = Field(
+        default="http://127.0.0.1:3000/auth/callback",
+        alias="FRONTEND_REDIRECT_URL",
+    )
+
+    jwt_secret: str = Field(default="change-me-in-prod", alias="JWT_SECRET")
+    jwt_algorithm: str = Field(default="HS256", alias="JWT_ALGORITHM")
+    jwt_expire_minutes: int = Field(default=60 * 24 * 7, alias="JWT_EXPIRE_MINUTES")
+    token_encryption_key: str = Field(default="", alias="TOKEN_ENCRYPTION_KEY")
+
 
 @lru_cache
 def get_settings() -> Settings:

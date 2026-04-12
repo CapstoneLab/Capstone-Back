@@ -1,8 +1,13 @@
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query
 
+from app.api.repos_router import router as repos_router
+from app.auth.router import router as auth_router
+from app.db import Base, engine
+from app.db_models import User  # noqa: F401  (ensures table is registered)
 from app.models import (
     PipelineResultPayload,
     PipelineResultResponse,
@@ -11,7 +16,24 @@ from app.models import (
 )
 from app.service import ResultStore, TriggerService, UbuntuResultFetcher
 
-app = FastAPI(title="Windows CI Trigger Backend", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        print("[startup] DB connected, tables ensured.")
+    except Exception as exc:
+        print(
+            f"[startup] WARNING: DB init skipped ({exc.__class__.__name__}: {exc}). "
+            "Server will run, but /auth/* endpoints will fail until DB is reachable."
+        )
+    yield
+
+
+app = FastAPI(title="Windows CI Trigger Backend", version="1.0.0", lifespan=lifespan)
+app.include_router(auth_router)
+app.include_router(repos_router)
 
 trigger_service = TriggerService()
 result_store = ResultStore()
