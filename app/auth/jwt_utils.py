@@ -15,6 +15,29 @@ settings = get_settings()
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
+# Extra GitHub /user fields to preserve in JWT so that /auth/me can return
+# them without hitting GitHub API again. Keeping this list explicit (instead
+# of dumping the whole raw payload) keeps the JWT small and avoids leaking
+# fields that may change meaning over time.
+_PROFILE_EXTRA_FIELDS = (
+    "bio",
+    "company",
+    "location",
+    "blog",
+    "html_url",
+    "public_repos",
+    "public_gists",
+    "followers",
+    "following",
+    "twitter_username",
+    "hireable",
+    "created_at",
+    "updated_at",
+    "type",
+    "site_admin",
+)
+
+
 def create_access_token(
     *,
     user_id: int | None,
@@ -22,6 +45,7 @@ def create_access_token(
     profile: dict[str, Any],
 ) -> str:
     now = datetime.now(timezone.utc)
+    extras = {k: profile.get(k) for k in _PROFILE_EXTRA_FIELDS if profile.get(k) is not None}
     payload: dict[str, Any] = {
         "sub": str(user_id) if user_id is not None else f"gh:{github_id}",
         "uid": user_id,
@@ -30,6 +54,7 @@ def create_access_token(
         "name": profile.get("display_name"),
         "avatar": profile.get("avatar_url"),
         "email": profile.get("email"),
+        "profile": extras,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=settings.jwt_expire_minutes)).timestamp()),
     }
@@ -59,6 +84,8 @@ async def get_current_user(
     if github_id is None:
         raise HTTPException(status_code=401, detail="invalid token payload")
 
+    profile_extras = payload.get("profile") or {}
+
     try:
         result = await db.execute(select(User).where(User.github_id == int(github_id)))
         user = result.scalar_one_or_none()
@@ -70,6 +97,9 @@ async def get_current_user(
                 "display_name": user.display_name,
                 "avatar_url": user.avatar_url,
                 "email": user.email,
+                # Extra fields come from JWT (not stored in DB yet) so the
+                # frontend still gets bio/followers/etc. after DB upsert.
+                **profile_extras,
                 "source": "db",
             }
     except Exception:
@@ -82,5 +112,6 @@ async def get_current_user(
         "display_name": payload.get("name"),
         "avatar_url": payload.get("avatar"),
         "email": payload.get("email"),
+        **profile_extras,
         "source": "jwt",
     }
