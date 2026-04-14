@@ -25,28 +25,11 @@ mkdir -p /opt/deployments/www
 # ── Download artifact from S3 ──
 aws s3 cp "s3://${S3_BUCKET}/${S3_KEY}/deploy.tar.gz" "/tmp/deploy_${OWNER}_${REPO}.tar.gz"
 
-# ── Preserve runtime secrets ──
-# .env is intentionally gitignored but contains production credentials
-# (GitHub OAuth client, JWT secret, DB URL, etc). Back it up before
-# wiping source/ so redeploys don't clobber prod config.
-ENV_BACKUP="/opt/deployments/config/${OWNER}/${REPO}/.env"
-if [ -f "${APP_DIR}/source/.env" ]; then
-  mkdir -p "$(dirname "$ENV_BACKUP")"
-  cp "${APP_DIR}/source/.env" "$ENV_BACKUP"
-fi
-
 # ── Extract ──
 rm -rf "${APP_DIR}/source"
 mkdir -p "${APP_DIR}/source"
 tar xzf "/tmp/deploy_${OWNER}_${REPO}.tar.gz" -C "${APP_DIR}/source"
 rm -f "/tmp/deploy_${OWNER}_${REPO}.tar.gz"
-
-# ── Restore runtime secrets ──
-# Backup takes precedence over anything accidentally shipped in the tarball
-# (e.g. a dev .env committed by mistake).
-if [ -f "$ENV_BACKUP" ]; then
-  cp "$ENV_BACKUP" "${APP_DIR}/source/.env"
-fi
 
 # ── Detect runtime ──
 cd "${APP_DIR}/source"
