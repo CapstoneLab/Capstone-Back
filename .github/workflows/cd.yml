@@ -70,10 +70,15 @@ jobs:
           S3_KEY="${{ steps.artifact.outputs.s3_key }}"
           S3_BUCKET="${{ secrets.S3_BUCKET }}"
 
+          # Export OAuth secrets as DEPLOY_* env vars for deploy.sh
+          DEPLOY_ENV="export DEPLOY_GITHUB_CLIENT_ID='${{ secrets.OAUTH_CLIENT_ID }}'"
+          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_GITHUB_CLIENT_SECRET='${{ secrets.OAUTH_CLIENT_SECRET }}'"
+          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_JWT_SECRET='${{ secrets.JWT_SECRET }}'"
+
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
-            --parameters "{\"commands\":[\"aws s3 cp s3://${S3_BUCKET}/scripts/deploy.sh /tmp/deploy.sh && chmod +x /tmp/deploy.sh && /tmp/deploy.sh ${OWNER} ${REPO} ${HASH} ${S3_BUCKET} ${S3_KEY}\"]}" \
+            --parameters "{\"commands\":[\"${DEPLOY_ENV} && aws s3 cp s3://${S3_BUCKET}/scripts/deploy.sh /tmp/deploy.sh && chmod +x /tmp/deploy.sh && /tmp/deploy.sh ${OWNER} ${REPO} ${HASH} ${S3_BUCKET} ${S3_KEY}\"]}" \
             --timeout-seconds 300 \
             --query "Command.CommandId" \
             --output text)
@@ -124,7 +129,7 @@ jobs:
         run: |
           OWNER="${{ steps.artifact.outputs.owner }}"
           REPO="${{ steps.artifact.outputs.repo }}"
-          URL="http://44.199.215.211/${OWNER}/${REPO}/health"
+          URL="http://ec2-54-221-222-244.compute-1.amazonaws.com/${OWNER}/${REPO}/health"
 
           echo "Checking ${URL}..."
           for i in $(seq 1 5); do

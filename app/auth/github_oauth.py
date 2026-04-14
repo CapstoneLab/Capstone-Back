@@ -68,10 +68,15 @@ async def fetch_github_user(access_token: str) -> dict[str, Any]:
                 if primary:
                     email = primary.get("email")
 
-    return {
-        "github_id": user_data["id"],
-        "github_login": user_data["login"],
-        "display_name": user_data.get("name"),
-        "avatar_url": user_data.get("avatar_url"),
-        "email": email,
-    }
+    # Return raw GitHub /user payload enriched with canonical aliases the
+    # rest of the app (JWT claims, DB upsert, /auth/me response) relies on.
+    # Raw fields like bio, company, location, blog, public_repos, followers,
+    # following, html_url, created_at, updated_at, twitter_username, etc.
+    # are preserved for the frontend to consume.
+    result = dict(user_data)
+    result["github_id"] = user_data["id"]
+    result["github_login"] = user_data["login"]
+    result["display_name"] = user_data.get("name")
+    result["avatar_url"] = user_data.get("avatar_url")
+    result["email"] = email
+    return result

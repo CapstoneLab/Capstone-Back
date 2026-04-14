@@ -1,3 +1,4 @@
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -31,7 +32,12 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Windows CI Trigger Backend", version="1.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="Windows CI Trigger Backend",
+    version="1.0.0",
+    lifespan=lifespan,
+    root_path=os.getenv("ROOT_PATH", ""),
+)
 app.include_router(auth_router)
 app.include_router(repos_router)
 

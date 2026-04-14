@@ -18,7 +18,12 @@ def _headers(access_token: str) -> dict[str, str]:
 
 
 async def list_user_repos(access_token: str) -> list[dict[str, Any]]:
-    """Fetch all repos the authenticated user can access (owner + collaborator)."""
+    """Fetch all repos the authenticated user can access (owner + collaborator).
+
+    Returns raw GitHub API payloads with a flattened `owner` shortcut added
+    (kept for backward compat with existing frontend code that reads `owner`
+    as a string). All original fields (including `owner` as object) are preserved.
+    """
     repos: list[dict[str, Any]] = []
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         for page in range(1, _MAX_PAGES + 1):
@@ -37,19 +42,8 @@ async def list_user_repos(access_token: str) -> list[dict[str, Any]]:
             if not isinstance(chunk, list) or not chunk:
                 break
             for repo in chunk:
-                repos.append(
-                    {
-                        "id": repo.get("id"),
-                        "name": repo.get("name"),
-                        "full_name": repo.get("full_name"),
-                        "owner": (repo.get("owner") or {}).get("login"),
-                        "private": repo.get("private"),
-                        "default_branch": repo.get("default_branch"),
-                        "language": repo.get("language"),
-                        "html_url": repo.get("html_url"),
-                        "updated_at": repo.get("updated_at"),
-                    }
-                )
+                repo["owner_login"] = (repo.get("owner") or {}).get("login")
+                repos.append(repo)
             if len(chunk) < _PER_PAGE:
                 break
     return repos
@@ -81,6 +75,7 @@ async def fetch_token_scopes(access_token: str) -> list[str]:
 
 
 async def list_org_repos(access_token: str, org: str) -> list[dict[str, Any]]:
+    """Raw GitHub org repos passthrough with `owner_login` shortcut added."""
     repos: list[dict[str, Any]] = []
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         for page in range(1, _MAX_PAGES + 1):
@@ -94,19 +89,8 @@ async def list_org_repos(access_token: str, org: str) -> list[dict[str, Any]]:
             if not isinstance(chunk, list) or not chunk:
                 break
             for repo in chunk:
-                repos.append(
-                    {
-                        "id": repo.get("id"),
-                        "name": repo.get("name"),
-                        "full_name": repo.get("full_name"),
-                        "owner": (repo.get("owner") or {}).get("login"),
-                        "private": repo.get("private"),
-                        "default_branch": repo.get("default_branch"),
-                        "language": repo.get("language"),
-                        "html_url": repo.get("html_url"),
-                        "updated_at": repo.get("updated_at"),
-                    }
-                )
+                repo["owner_login"] = (repo.get("owner") or {}).get("login")
+                repos.append(repo)
             if len(chunk) < _PER_PAGE:
                 break
     return repos
@@ -115,6 +99,7 @@ async def list_org_repos(access_token: str, org: str) -> list[dict[str, Any]]:
 async def list_repo_branches(
     access_token: str, owner: str, repo: str
 ) -> list[dict[str, Any]]:
+    """Raw GitHub branches passthrough with `commit_sha` shortcut added."""
     branches: list[dict[str, Any]] = []
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         for page in range(1, _MAX_PAGES + 1):
@@ -128,14 +113,8 @@ async def list_repo_branches(
             if not isinstance(chunk, list) or not chunk:
                 break
             for br in chunk:
-                commit = br.get("commit") or {}
-                branches.append(
-                    {
-                        "name": br.get("name"),
-                        "protected": br.get("protected", False),
-                        "commit_sha": commit.get("sha"),
-                    }
-                )
+                br["commit_sha"] = (br.get("commit") or {}).get("sha")
+                branches.append(br)
             if len(chunk) < _PER_PAGE:
                 break
     return branches
