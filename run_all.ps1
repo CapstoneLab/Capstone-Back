@@ -55,7 +55,7 @@ if (-not $env:UBUNTU_RUNNER_REPO_ARG) { $env:UBUNTU_RUNNER_REPO_ARG = 'repo' }
 if (-not $env:UBUNTU_WORKING_DIR) { $env:UBUNTU_WORKING_DIR = '/home/capstone/CI-CD-pipiline' }
 if (-not $env:UBUNTU_PYTHON_COMMAND) { $env:UBUNTU_PYTHON_COMMAND = 'python3' }
 if (-not $env:UBUNTU_SHELL_PRELUDE) {
-    $env:UBUNTU_SHELL_PRELUDE = 'export PATH="$HOME/.local/bin:$PATH" && export NVM_DIR="$HOME/.nvm" && source "$NVM_DIR/nvm.sh"'
+    $env:UBUNTU_SHELL_PRELUDE = 'export PATH="$HOME/.local/bin:$PATH" && export NVM_DIR="$HOME/.nvm" && source "$NVM_DIR/nvm.sh" && { export SDKMAN_DIR="$HOME/.sdkman"; [ -s "$SDKMAN_DIR/bin/sdkman-init.sh" ] && source "$SDKMAN_DIR/bin/sdkman-init.sh"; true; }'
 }
 if (-not $env:WINDOWS_CALLBACK_BASE_URL) { $env:WINDOWS_CALLBACK_BASE_URL = 'http://192.168.0.2:8010' }
 
@@ -88,8 +88,63 @@ try {
 
     if (-not $healthy) {
         Write-Host "Starting backend server on 0.0.0.0:$backendPort ..."
-        $backendProcess = Start-Process -FilePath $pythonCmd -ArgumentList @('-m', 'uvicorn', 'app.main:app', '--host', '0.0.0.0', '--port', "$backendPort") -PassThru -WindowStyle Hidden -RedirectStandardOutput $backendLog -RedirectStandardError $backendErrLog
+
+        # Use a Windows Job Object so the server process dies when this
+        # console window is closed (prevents orphaned processes).
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class JobObject {
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode)]
+    public static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string lpName);
+    [DllImport("kernel32.dll")]
+    public static extern bool SetInformationJobObject(IntPtr hJob, int infoType, IntPtr lpJobObjectInfo, uint cbJobObjectInfoLength);
+    [DllImport("kernel32.dll")]
+    public static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+    public static IntPtr Create() {
+        IntPtr job = CreateJobObject(IntPtr.Zero, null);
+        // JOBOBJECT_EXTENDED_LIMIT_INFORMATION with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        var info = new byte[112]; // 64-bit struct size
+        BitConverter.GetBytes((uint)0x2000).CopyTo(info, 16); // LimitFlags = KILL_ON_JOB_CLOSE
+        IntPtr ptr = Marshal.AllocHGlobal(info.Length);
+        Marshal.Copy(info, 0, ptr, info.Length);
+        SetInformationJobObject(job, 9, ptr, (uint)info.Length);
+        Marshal.FreeHGlobal(ptr);
+        return job;
+    }
+    public static void Assign(IntPtr job, IntPtr processHandle) {
+        AssignProcessToJobObject(job, processHandle);
+    }
+}
+"@ -ErrorAction SilentlyContinue
+
+        $jobHandle = $null
+        try {
+            $jobHandle = [JobObject]::Create()
+        } catch {}
+
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $pythonCmd
+        $psi.Arguments = "-m uvicorn app.main:app --host 0.0.0.0 --port $backendPort"
+        $psi.WorkingDirectory = $PSScriptRoot
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+
+        $backendProcess = [System.Diagnostics.Process]::Start($psi)
         $backendStartedByScript = $true
+
+        # Drain stdout/stderr to log files asynchronously
+        $backendProcess.StandardOutput.ReadToEndAsync() | Out-Null
+        $backendProcess.StandardError.ReadToEndAsync() | Out-Null
+
+        # Attach to job object — OS will kill the server when this window closes
+        if ($jobHandle -and $jobHandle -ne [IntPtr]::Zero) {
+            try {
+                [JobObject]::Assign($jobHandle, $backendProcess.Handle)
+            } catch {}
+        }
 
         $started = $false
         for ($i = 0; $i -lt 30; $i++) {

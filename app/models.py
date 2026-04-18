@@ -18,14 +18,27 @@ class StartPipelineResponse(BaseModel):
 
 class PipelineResultPayload(BaseModel):
     job_id: str
-    status: Literal["success", "failed", "running"]
+    # Engine sends "status" for pipeline_complete, "pipeline_status" for step_complete
+    status: Literal["success", "failed", "running"] | None = None
+    pipeline_status: Literal["success", "failed", "running"] | None = None
     repo_url: str
     branch: str = "main"
-    started_at: datetime
+    started_at: datetime | None = None
     ended_at: datetime | None = None
     logs: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
     steps: list[dict[str, Any]] = Field(default_factory=list)
+    # Engine sends these at top level for step_complete callbacks
+    type: str | None = None
+    step: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def effective_status(self) -> str:
+        return self.status or self.pipeline_status or "running"
+
+    @property
+    def callback_type(self) -> str:
+        return self.type or (self.metadata.get("type") if self.metadata else None) or "pipeline_complete"
 
 
 class PipelineResultResponse(BaseModel):

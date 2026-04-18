@@ -55,27 +55,61 @@ def start_pipeline(base_url: str, repo: str, branch: str) -> str:
     return body["job_id"]
 
 
+def _fetch_completed_steps(base_url: str, job_id: str) -> list[dict]:
+    try:
+        resp = requests.get(
+            f"{base_url}/pipeline-steps",
+            params={"job_id": job_id},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            return resp.json().get("steps", [])
+    except Exception:
+        pass
+    return []
+
+
+def _print_step(step: dict) -> None:
+    name = step.get("step_name") or step.get("name") or step.get("step") or "unknown"
+    status = step.get("status", "unknown")
+    summary = step.get("summary_message") or step.get("summary") or ""
+
+    status_icon = {"success": "+", "failed": "X", "skipped": "-"}.get(status, "?")
+    print(f"\n  [{status_icon}] {name}: {status}", end="")
+    if summary:
+        print(f" ({summary})", end="")
+    print()
+
+
 def poll_results(base_url: str, job_id: str, poll_interval: int) -> dict:
     start_ts = time.time()
+    printed_step_count = 0
 
     while True:
         elapsed = int(time.time() - start_ts)
 
+        # Check if final result is ready
         response = requests.get(
             f"{base_url}/get-results",
             params={"job_id": job_id},
         )
         response.raise_for_status()
         payload = response.json()
-
         found = payload.get("found", False)
-        if found:
-            print(f"[{elapsed:>3}s] 결과 수신 완료")
-        else:
-            print(f"[{elapsed:>3}s] 우분투에서 돌아가는 중입니다...")
+
+        # Fetch and display newly completed steps
+        all_steps = _fetch_completed_steps(base_url, job_id)
+        new_steps = all_steps[printed_step_count:]
+        for step in new_steps:
+            _print_step(step)
+        printed_step_count = len(all_steps)
 
         if found:
+            print(f"\n[{elapsed:>3}s] 결과 수신 완료")
             return payload
+
+        if not new_steps:
+            print(f"[{elapsed:>3}s] 우분투에서 돌아가는 중입니다...")
 
         time.sleep(poll_interval)
 

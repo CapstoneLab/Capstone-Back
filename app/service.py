@@ -133,6 +133,27 @@ class UbuntuResultFetcher:
         except Exception:
             return None
 
+    def fetch_log_lines(self, job_id: str) -> list[str]:
+        log_file = f"/tmp/ci_runner_{job_id}.log"
+        try:
+            ssh = self._connect_ssh()
+            sftp = ssh.open_sftp()
+            try:
+                with sftp.open(log_file, "r") as fp:
+                    raw = fp.read()
+            except FileNotFoundError:
+                sftp.close()
+                ssh.close()
+                return []
+            sftp.close()
+            ssh.close()
+
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", "replace")
+            return raw.splitlines()
+        except Exception:
+            return []
+
     def fetch_result_by_job_id(self, job_id: str, scan_limit: int = 60) -> dict | None:
         if not job_id:
             return None

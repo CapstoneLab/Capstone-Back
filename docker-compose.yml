@@ -1,0 +1,18 @@
+version: "3.8"
+
+services:
+  db:
+    image: postgres:14
+    container_name: cicd-local-db
+    environment:
+      POSTGRES_DB: cidb
+      POSTGRES_USER: ciuser
+      POSTGRES_PASSWORD: cipass
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./docs/init.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
