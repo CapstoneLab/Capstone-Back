@@ -6,7 +6,7 @@ from app.main import app
 
 
 class DummyTrigger:
-    def trigger(self, *, job_id: str, repo_url: str, branch: str) -> None:
+    def trigger(self, *, job_id: str, repo_url: str, branch: str, env_vars=None) -> None:
         return
 
 
