@@ -39,16 +39,36 @@ def ask_repo_if_needed(repo: str) -> str:
     if repo.strip():
         return repo.strip()
 
-    value = input("파이썬 터미널 창에 깃허브 레포지토리를 입력하세요 : ").strip()
+    value = input("깃허브 레포지토리 URL을 입력하세요 : ").strip()
     if not value:
         raise ValueError("레포지토리 URL은 필수입니다")
     return value
 
 
-def start_pipeline(base_url: str, repo: str, branch: str) -> str:
+def ask_env_vars() -> dict[str, str]:
+    """환경변수를 키/값 쌍으로 입력받는다. 빈 키 입력 시 종료."""
+    env_vars: dict[str, str] = {}
+    print("\n환경변수 설정 (없으면 Enter로 건너뛰기)")
+    idx = 1
+    while True:
+        key = input(f"  [{idx}] 환경변수 키 (없으면 Enter): ").strip()
+        if not key:
+            break
+        value = input(f"  [{idx}] {key} 의 값: ").strip()
+        env_vars[key] = value
+        idx += 1
+    if env_vars:
+        print(f"  → {len(env_vars)}개 환경변수 설정됨")
+    return env_vars
+
+
+def start_pipeline(base_url: str, repo: str, branch: str, env_vars: dict[str, str] | None = None) -> str:
+    payload: dict = {"repo_url": repo, "branch": branch}
+    if env_vars:
+        payload["env_vars"] = env_vars
     response = requests.post(
         f"{base_url}/start-pipeline",
-        json={"repo_url": repo, "branch": branch},
+        json=payload,
     )
     response.raise_for_status()
     body = response.json()
@@ -289,10 +309,11 @@ def main() -> int:
     try:
         args = parse_args()
         repo = ask_repo_if_needed(args.repo)
+        env_vars = ask_env_vars()
         backend_base_url = normalize_backend_url(args.backend_url)
 
         print("파이프라인 시작 요청 중...")
-        job_id = start_pipeline(backend_base_url, repo, args.branch)
+        job_id = start_pipeline(backend_base_url, repo, args.branch, env_vars)
         print("job_id:", job_id)
 
         print("우분투에서 파이프라인이 실행 중입니다. 결과를 기다리는 중...")

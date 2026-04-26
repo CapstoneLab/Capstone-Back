@@ -8,6 +8,7 @@ class StartPipelineRequest(BaseModel):
     repo_url: HttpUrl
     branch: str = "main"
     trigger_source: str = "windows-api"
+    env_vars: dict[str, str] = Field(default_factory=dict)
 
 
 class StartPipelineResponse(BaseModel):

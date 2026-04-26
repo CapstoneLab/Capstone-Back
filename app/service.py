@@ -11,11 +11,11 @@ class TriggerService:
     def __init__(self) -> None:
         self.settings = get_settings()
 
-    def trigger(self, *, job_id: str, repo_url: str, branch: str) -> None:
-        self._trigger_ssh(job_id=job_id, repo_url=repo_url, branch=branch)
+    def trigger(self, *, job_id: str, repo_url: str, branch: str, env_vars: dict[str, str] | None = None) -> None:
+        self._trigger_ssh(job_id=job_id, repo_url=repo_url, branch=branch, env_vars=env_vars)
 
-    def _trigger_ssh(self, *, job_id: str, repo_url: str, branch: str) -> None:
-        remote_cmd = self._build_remote_command(job_id=job_id, repo_url=repo_url, branch=branch)
+    def _trigger_ssh(self, *, job_id: str, repo_url: str, branch: str, env_vars: dict[str, str] | None = None) -> None:
+        remote_cmd = self._build_remote_command(job_id=job_id, repo_url=repo_url, branch=branch, env_vars=env_vars)
         print(f"[DEBUG] SSH connecting to {self.settings.ubuntu_ssh_host}:{self.settings.ubuntu_ssh_port} as {self.settings.ubuntu_ssh_user}")
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -41,7 +41,7 @@ class TriggerService:
         finally:
             ssh.close()
 
-    def _build_remote_command(self, *, job_id: str, repo_url: str, branch: str) -> str:
+    def _build_remote_command(self, *, job_id: str, repo_url: str, branch: str, env_vars: dict[str, str] | None = None) -> str:
         callback_url = f"{self.settings.windows_callback_base_url}/get-results"
         repo_arg_name = self.settings.ubuntu_runner_repo_arg.strip().lstrip("-") or "repo"
 
@@ -51,6 +51,7 @@ class TriggerService:
             f"--job-id {shlex.quote(job_id)} "
             f"--{repo_arg_name} {shlex.quote(repo_url)} "
             f"--branch {shlex.quote(branch)} "
+            f"--source capstone "
             f"--callback-url {shlex.quote(callback_url)} "
             f"--callback-token internal"
         )
@@ -63,6 +64,11 @@ class TriggerService:
         prelude = self.settings.ubuntu_shell_prelude.strip()
         if prelude:
             parts.append(prelude)
+
+        # 환경변수 export 추가
+        if env_vars:
+            for key, value in env_vars.items():
+                parts.append(f"export {shlex.quote(key)}={shlex.quote(value)}")
 
         parts.append(runner_cmd)
         return " && ".join(parts)
