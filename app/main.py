@@ -781,6 +781,12 @@ async def get_job_findings(job_id: str) -> dict:
             )
             findings = []
             for f in result.scalars().all():
+                # code_snippet_start_line 계산
+                snippet_start = None
+                if f.code_snippet and f.line_number:
+                    snippet_lines = f.code_snippet.count("\n")
+                    snippet_start = max(1, f.line_number - (snippet_lines // 2))
+
                 findings.append({
                     "finding_id": f.finding_id,
                     "scan_type": f.scan_type,
@@ -790,6 +796,8 @@ async def get_job_findings(job_id: str) -> dict:
                     "file_path": f.file_path,
                     "line_number": f.line_number,
                     "message": f.message,
+                    "code_snippet": f.code_snippet,
+                    "code_snippet_start_line": snippet_start,
                     "ai_fix_suggestion": f.ai_fix_suggestion,
                     "created_at": f.created_at.isoformat() if f.created_at else None,
                 })
