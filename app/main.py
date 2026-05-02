@@ -679,6 +679,126 @@ def _guess_artifact_type(name: str) -> str:
     return "other"
 
 
+# ── /api/jobs/{job_id} — 프론트엔드용 상세 조회 API ──────────────────────────
+
+@app.get("/api/jobs/{job_id}")
+async def get_job_detail(job_id: str) -> dict:
+    """job 상세 조회: job 정보 + steps + security_summary(verdict) 포함."""
+    try:
+        async with SessionLocal() as session:
+            # 1) pipeline_jobs
+            job = await session.get(PipelineJob, job_id)
+            if not job:
+                raise HTTPException(status_code=404, detail="job not found")
+
+            job_dict = {
+                "job_id": job.job_id,
+                "repo_url": job.repo_url,
+                "branch": job.branch,
+                "trigger_source": job.trigger_source,
+                "status": job.status,
+                "overall_result": job.overall_result,
+                "created_at": job.created_at.isoformat() if job.created_at else None,
+                "started_at": job.started_at.isoformat() if job.started_at else None,
+                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+                "duration_secs": job.duration_secs,
+                "metadata": job.metadata_,
+            }
+
+            # 2) pipeline_steps (duration_secs 계산 포함)
+            steps_result = await session.execute(
+                select(PipelineStep)
+                .where(PipelineStep.job_id == job_id)
+                .order_by(PipelineStep.created_at)
+            )
+            steps_list = []
+            for step in steps_result.scalars().all():
+                duration = step.duration_secs
+                if duration is None and step.started_at and step.ended_at:
+                    duration = round((step.ended_at - step.started_at).total_seconds(), 2)
+                steps_list.append({
+                    "step_id": step.step_id,
+                    "step_name": step.step_name,
+                    "step_type": step.step_type,
+                    "status": step.status,
+                    "error_message": step.error_message,
+                    "started_at": step.started_at.isoformat() if step.started_at else None,
+                    "ended_at": step.ended_at.isoformat() if step.ended_at else None,
+                    "duration_secs": duration,
+                })
+
+            # 현재 진행 중인 step
+            current_step = None
+            for s in steps_list:
+                if s["status"] == "running":
+                    current_step = s["step_name"]
+                    break
+
+            # 3) security_summary (verdict 역할)
+            summary_result = await session.execute(
+                select(SecuritySummary).where(SecuritySummary.job_id == job_id)
+            )
+            summary = summary_result.scalar()
+            security_data = None
+            if summary:
+                security_data = {
+                    "verdict": {
+                        "overall_status": summary.overall_status,
+                        "status_reason": summary.status_reason,
+                        "total_findings": summary.total_findings,
+                    },
+                    "summaries": [
+                        {"scanner": "gitleaks", "count": summary.gitleaks_count,
+                         "critical": 0, "high": summary.gitleaks_count, "medium": 0, "low": 0},
+                        {"scanner": "semgrep", "count": summary.semgrep_count,
+                         "critical": summary.critical_count, "high": max(0, summary.high_count - summary.gitleaks_count),
+                         "medium": summary.medium_count, "low": summary.low_count},
+                    ],
+                }
+
+            return {
+                "job": job_dict,
+                "steps": steps_list,
+                "current_step": current_step,
+                "security": security_data,
+            }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/jobs/{job_id}/findings")
+async def get_job_findings(job_id: str) -> dict:
+    """job의 security_findings 목록 조회."""
+    try:
+        async with SessionLocal() as session:
+            result = await session.execute(
+                select(SecurityFinding)
+                .where(SecurityFinding.job_id == job_id)
+                .order_by(SecurityFinding.created_at)
+            )
+            findings = []
+            for f in result.scalars().all():
+                findings.append({
+                    "finding_id": f.finding_id,
+                    "scan_type": f.scan_type,
+                    "severity": f.severity,
+                    "rule_id": f.rule_id,
+                    "rule_name": f.rule_name,
+                    "file_path": f.file_path,
+                    "line_number": f.line_number,
+                    "message": f.message,
+                    "ai_fix_suggestion": f.ai_fix_suggestion,
+                    "created_at": f.created_at.isoformat() if f.created_at else None,
+                })
+            return {"job_id": job_id, "count": len(findings), "findings": findings}
+
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/pipeline-logs")
 def pipeline_logs(job_id: str = Query(..., min_length=1)) -> dict:
     lines = result_fetcher.fetch_log_lines(job_id)
