@@ -389,7 +389,11 @@ async def _save_parsed_data_to_db(job_id: str, obj: dict) -> None:
                         if aifix_m and parsed_findings:
                             parsed_findings[-1]["ai_fix"] = aifix_m.group(1).strip()
 
-            # 2단계: 같은 취약점(rule_id + file_path + line_number)이 DB에 이미 있으면 기존 AI 권고사항 재사용
+            # 2단계: GitHub에서 code snippet 가져오기 + DB 저장
+            repo_url = obj.get("repo_url", "")
+            branch = obj.get("branch", "main")
+            snippet_cache: dict[str, list[str] | None] = {}  # file_path → lines
+
             for f in parsed_findings:
                 if f["scan_type"] == "gitleaks":
                     sev_counts["high"] += 1
@@ -400,7 +404,6 @@ async def _save_parsed_data_to_db(job_id: str, obj: dict) -> None:
 
                 ai_fix = f["ai_fix"]
                 if not ai_fix:
-                    # DB에서 동일 취약점의 기존 AI 권고사항 조회
                     existing = await session.execute(
                         select(SecurityFinding.ai_fix_suggestion)
                         .where(
@@ -415,6 +418,34 @@ async def _save_parsed_data_to_db(job_id: str, obj: dict) -> None:
                     if row and row[0]:
                         ai_fix = row[0]
 
+                # code snippet 가져오기
+                code_snippet = None
+                file_path = f["file_path"]
+                line_num = f["line_number"]
+
+                if file_path not in snippet_cache:
+                    snippet_cache[file_path] = _fetch_file_from_github(repo_url, branch, file_path)
+
+                file_lines = snippet_cache[file_path]
+                if file_lines and line_num > 0:
+                    context = 3
+                    start = max(0, line_num - 1 - context)
+                    end = min(len(file_lines), line_num + context)
+                    snippet_lines = file_lines[start:end]
+
+                    # gitleaks: secret 라인 마스킹
+                    if f["scan_type"] == "gitleaks":
+                        target_idx = line_num - 1 - start
+                        if 0 <= target_idx < len(snippet_lines):
+                            snippet_lines[target_idx] = re.sub(
+                                r'["\']([^"\']{4,})["\']',
+                                lambda m: f'"{" ****" if len(m.group(1)) > 4 else "****"}"',
+                                snippet_lines[target_idx]
+                            )
+
+                    code_snippet = "\n".join(snippet_lines)
+                    f["snippet_start_line"] = start + 1
+
                 session.add(SecurityFinding(
                     job_id=job_id,
                     step_id=f["step_id"],
@@ -427,6 +458,7 @@ async def _save_parsed_data_to_db(job_id: str, obj: dict) -> None:
                     message=f["message"],
                     is_masked=f["scan_type"] == "gitleaks",
                     ai_fix_suggestion=ai_fix,
+                    code_snippet=code_snippet,
                 ))
 
             total_findings = gitleaks_count + semgrep_count
@@ -521,6 +553,25 @@ async def _save_parsed_data_to_db(job_id: str, obj: dict) -> None:
         import traceback
         traceback.print_exc()
         print(f"[DB] _save_parsed_data_to_db failed: {exc}")
+
+
+def _fetch_file_from_github(repo_url: str, branch: str, file_path: str) -> list[str] | None:
+    """GitHub raw URL에서 소스 파일을 읽어 줄 단위 리스트로 반환."""
+    # https://github.com/owner/repo.git → owner/repo
+    import re as _re
+    m = _re.search(r"github\.com[/:]([^/]+/[^/.]+)", repo_url)
+    if not m:
+        return None
+    owner_repo = m.group(1)
+    raw_url = f"https://raw.githubusercontent.com/{owner_repo}/{branch}/{file_path}"
+    try:
+        import urllib.request
+        req = urllib.request.Request(raw_url, headers={"User-Agent": "ci-cd-backend"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            content = resp.read().decode("utf-8", errors="replace")
+        return content.splitlines()
+    except Exception:
+        return None
 
 
 def _normalize_severity(raw: str) -> str:
