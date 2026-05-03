@@ -11,6 +11,13 @@ class StartPipelineRequest(BaseModel):
     env_vars: dict[str, str] = Field(default_factory=dict)
 
 
+class SecurityPayload(BaseModel):
+    """엔진이 콜백으로 보내는 security 블록."""
+    findings: list[dict[str, Any]] = Field(default_factory=list)
+    summaries: list[dict[str, Any]] = Field(default_factory=list)
+    verdict: dict[str, Any] = Field(default_factory=dict)
+
+
 class StartPipelineResponse(BaseModel):
     job_id: str
     status: Literal["queued", "triggered"]
@@ -29,6 +36,7 @@ class PipelineResultPayload(BaseModel):
     logs: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
     steps: list[dict[str, Any]] = Field(default_factory=list)
+    security: dict[str, Any] = Field(default_factory=dict)
     # Engine sends these at top level for step_complete callbacks
     type: str | None = None
     step: dict[str, Any] = Field(default_factory=dict)

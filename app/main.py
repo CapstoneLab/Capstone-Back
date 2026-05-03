@@ -321,7 +321,7 @@ async def _save_parsed_data_to_db(job_id: str, obj: dict) -> None:
             # ── 1) step_logs: 로그 라인 개별 저장 ──
             await _save_log_lines(session, job_id, logs, step_map)
 
-            # ── 2) security_findings: 로그에서 gitleaks/semgrep 파싱 ──
+            # ── 2) security_findings ──
             gitleaks_count = 0
             semgrep_count = 0
             sev_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
@@ -329,137 +329,160 @@ async def _save_parsed_data_to_db(job_id: str, obj: dict) -> None:
             gitleaks_step_id = step_map.get("lightweight-security")
             semgrep_step_id = step_map.get("deep-security")
 
-            # gitleaks 로그 패턴: [N] rule=RULE | FILE:LINE | MESSAGE
-            re_gitleaks = re.compile(
-                r"\s*\[(\d+)\]\s+rule=([^\s|]+)\s*\|\s*([^:]+):(\d+)\s*\|\s*(.*)"
-            )
-            # semgrep 로그 패턴: [N] [SEVERITY] RULE_ID | FILE:LINE | MESSAGE
-            re_semgrep = re.compile(
-                r"\s*\[(\d+)\]\s+\[(\w+)\]\s+([^\s|]+)\s*\|\s*([^:]+):(\d+)\s*\|\s*(.*)"
-            )
-            # [AI-FIX] 내용 추출용
-            re_aifix = re.compile(r"\s*\[AI-FIX\]\s*(.*)")
+            # 엔진이 security.findings를 구조화 JSON으로 보내면 그걸 우선 사용
+            security_block = obj.get("security", {})
+            structured_findings = security_block.get("findings", [])
 
-            # 1단계: 로그에서 findings + AI-FIX 파싱
-            parsed_findings: list[dict] = []
-
-            for i, line in enumerate(logs):
-                # gitleaks findings
-                if "[lightweight-security.log]" in line and gitleaks_step_id:
-                    content_match = re.match(r"^\[lightweight-security\.log\]\s*(?:\[[^\]]*\]\s*)?(.*)", line)
-                    if not content_match:
+            if structured_findings:
+                # ── 구조화된 findings 사용 (엔진 신규 포맷) ──
+                for f in structured_findings:
+                    scanner = f.get("scanner_name", "semgrep")
+                    scan_type = "gitleaks" if scanner == "gitleaks" else "semgrep"
+                    step_id = gitleaks_step_id if scan_type == "gitleaks" else semgrep_step_id
+                    if not step_id:
                         continue
-                    content = content_match.group(1)
-                    m = re_gitleaks.match(content)
-                    if m:
-                        parsed_findings.append({
-                            "scan_type": "gitleaks",
-                            "step_id": gitleaks_step_id,
-                            "severity": "high",
-                            "rule_id": m.group(2),
-                            "file_path": m.group(3).strip(),
-                            "line_number": int(m.group(4)),
-                            "message": m.group(5).strip(),
-                            "ai_fix": None,
-                            "log_index": i,
-                        })
 
-                # semgrep findings
-                elif "[deep-security.log]" in line and semgrep_step_id:
-                    content_match = re.match(r"^\[deep-security\.log\]\s*(?:\[[^\]]*\]\s*)?(.*)", line)
-                    if not content_match:
-                        continue
-                    content = content_match.group(1)
-                    m = re_semgrep.match(content)
-                    if m:
-                        parsed_findings.append({
-                            "scan_type": "semgrep",
-                            "step_id": semgrep_step_id,
-                            "severity": _normalize_severity(m.group(2)),
-                            "rule_id": m.group(3),
-                            "file_path": m.group(4).strip(),
-                            "line_number": int(m.group(5)),
-                            "message": m.group(6).strip()[:2000],
-                            "ai_fix": None,
-                            "log_index": i,
-                        })
+                    severity = _normalize_severity(f.get("severity", "medium"))
+                    if scan_type == "gitleaks":
+                        gitleaks_count += 1
                     else:
-                        # finding이 아닌 줄에서 [AI-FIX] 확인
-                        aifix_m = re_aifix.match(content)
-                        if aifix_m and parsed_findings:
-                            parsed_findings[-1]["ai_fix"] = aifix_m.group(1).strip()
+                        semgrep_count += 1
+                    sev_counts[severity] = sev_counts.get(severity, 0) + 1
 
-            # 2단계: GitHub에서 code snippet 가져오기 + DB 저장
-            repo_url = obj.get("repo_url", "")
-            branch = obj.get("branch", "main")
-            snippet_cache: dict[str, list[str] | None] = {}  # file_path → lines
-
-            for f in parsed_findings:
-                if f["scan_type"] == "gitleaks":
-                    sev_counts["high"] += 1
-                    gitleaks_count += 1
-                else:
-                    sev_counts[f["severity"]] = sev_counts.get(f["severity"], 0) + 1
-                    semgrep_count += 1
-
-                ai_fix = f["ai_fix"]
-                if not ai_fix:
-                    existing = await session.execute(
-                        select(SecurityFinding.ai_fix_suggestion)
-                        .where(
-                            SecurityFinding.rule_id == f["rule_id"],
-                            SecurityFinding.file_path == f["file_path"],
-                            SecurityFinding.line_number == f["line_number"],
-                            SecurityFinding.ai_fix_suggestion.isnot(None),
-                        )
-                        .limit(1)
-                    )
-                    row = existing.first()
-                    if row and row[0]:
-                        ai_fix = row[0]
-
-                # code snippet 가져오기
-                code_snippet = None
-                file_path = f["file_path"]
-                line_num = f["line_number"]
-
-                if file_path not in snippet_cache:
-                    snippet_cache[file_path] = _fetch_file_from_github(repo_url, branch, file_path)
-
-                file_lines = snippet_cache[file_path]
-                if file_lines and line_num > 0:
-                    context = 3
-                    start = max(0, line_num - 1 - context)
-                    end = min(len(file_lines), line_num + context)
-                    snippet_lines = file_lines[start:end]
-
-                    # gitleaks: secret 라인 마스킹
-                    if f["scan_type"] == "gitleaks":
-                        target_idx = line_num - 1 - start
-                        if 0 <= target_idx < len(snippet_lines):
-                            snippet_lines[target_idx] = re.sub(
-                                r'["\']([^"\']{4,})["\']',
-                                lambda m: f'"{" ****" if len(m.group(1)) > 4 else "****"}"',
-                                snippet_lines[target_idx]
+                    # AI 권고사항: 콜백에서 온 것 우선, 없으면 DB에서 재사용
+                    ai_fix = f.get("ai_recommendation")
+                    if not ai_fix:
+                        existing = await session.execute(
+                            select(SecurityFinding.ai_fix_suggestion)
+                            .where(
+                                SecurityFinding.rule_id == f.get("rule_id", ""),
+                                SecurityFinding.file_path == f.get("file_path", ""),
+                                SecurityFinding.line_number == f.get("line_number", 0),
+                                SecurityFinding.ai_fix_suggestion.isnot(None),
                             )
+                            .limit(1)
+                        )
+                        row = existing.first()
+                        if row and row[0]:
+                            ai_fix = row[0]
 
-                    code_snippet = "\n".join(snippet_lines)
-                    f["snippet_start_line"] = start + 1
+                    session.add(SecurityFinding(
+                        job_id=job_id,
+                        step_id=step_id,
+                        scan_type=scan_type,
+                        severity=severity,
+                        rule_id=f.get("rule_id", "unknown"),
+                        rule_name=f.get("title") or f.get("rule_id", ""),
+                        file_path=f.get("file_path", ""),
+                        line_number=f.get("line_number", 0),
+                        message=(f.get("message", "") or "")[:2000],
+                        is_masked=scan_type == "gitleaks",
+                        ai_fix_suggestion=ai_fix,
+                        code_snippet=f.get("code_snippet"),
+                    ))
 
-                session.add(SecurityFinding(
-                    job_id=job_id,
-                    step_id=f["step_id"],
-                    scan_type=f["scan_type"],
-                    severity=f["severity"],
-                    rule_id=f["rule_id"],
-                    rule_name=f["rule_id"],
-                    file_path=f["file_path"],
-                    line_number=f["line_number"],
-                    message=f["message"],
-                    is_masked=f["scan_type"] == "gitleaks",
-                    ai_fix_suggestion=ai_fix,
-                    code_snippet=code_snippet,
-                ))
+            else:
+                # ── Fallback: 로그 텍스트에서 regex 파싱 (이전 엔진 호환) ──
+                re_gitleaks = re.compile(
+                    r"\s*\[(\d+)\]\s+rule=([^\s|]+)\s*\|\s*([^:]+):(\d+)\s*\|\s*(.*)"
+                )
+                re_semgrep = re.compile(
+                    r"\s*\[(\d+)\]\s+\[(\w+)\]\s+([^\s|]+)\s*\|\s*([^:]+):(\d+)\s*\|\s*(.*)"
+                )
+                re_aifix = re.compile(r"\s*\[AI-FIX\]\s*(.*)")
+
+                parsed_findings: list[dict] = []
+                for i, line in enumerate(logs):
+                    if "[lightweight-security.log]" in line and gitleaks_step_id:
+                        content_match = re.match(r"^\[lightweight-security\.log\]\s*(?:\[[^\]]*\]\s*)?(.*)", line)
+                        if not content_match:
+                            continue
+                        content = content_match.group(1)
+                        m = re_gitleaks.match(content)
+                        if m:
+                            parsed_findings.append({
+                                "scan_type": "gitleaks", "step_id": gitleaks_step_id,
+                                "severity": "high", "rule_id": m.group(2),
+                                "file_path": m.group(3).strip(), "line_number": int(m.group(4)),
+                                "message": m.group(5).strip(), "ai_fix": None,
+                            })
+                    elif "[deep-security.log]" in line and semgrep_step_id:
+                        content_match = re.match(r"^\[deep-security\.log\]\s*(?:\[[^\]]*\]\s*)?(.*)", line)
+                        if not content_match:
+                            continue
+                        content = content_match.group(1)
+                        m = re_semgrep.match(content)
+                        if m:
+                            parsed_findings.append({
+                                "scan_type": "semgrep", "step_id": semgrep_step_id,
+                                "severity": _normalize_severity(m.group(2)), "rule_id": m.group(3),
+                                "file_path": m.group(4).strip(), "line_number": int(m.group(5)),
+                                "message": m.group(6).strip()[:2000], "ai_fix": None,
+                            })
+                        else:
+                            aifix_m = re_aifix.match(content)
+                            if aifix_m and parsed_findings:
+                                parsed_findings[-1]["ai_fix"] = aifix_m.group(1).strip()
+
+                # GitHub에서 code snippet + DB 저장
+                repo_url = obj.get("repo_url", "")
+                branch = obj.get("branch", "main")
+                snippet_cache: dict[str, list[str] | None] = {}
+
+                for f in parsed_findings:
+                    if f["scan_type"] == "gitleaks":
+                        sev_counts["high"] += 1
+                        gitleaks_count += 1
+                    else:
+                        sev_counts[f["severity"]] = sev_counts.get(f["severity"], 0) + 1
+                        semgrep_count += 1
+
+                    ai_fix = f["ai_fix"]
+                    if not ai_fix:
+                        existing = await session.execute(
+                            select(SecurityFinding.ai_fix_suggestion)
+                            .where(
+                                SecurityFinding.rule_id == f["rule_id"],
+                                SecurityFinding.file_path == f["file_path"],
+                                SecurityFinding.line_number == f["line_number"],
+                                SecurityFinding.ai_fix_suggestion.isnot(None),
+                            )
+                            .limit(1)
+                        )
+                        row = existing.first()
+                        if row and row[0]:
+                            ai_fix = row[0]
+
+                    # GitHub에서 code snippet
+                    code_snippet = None
+                    file_path = f["file_path"]
+                    line_num = f["line_number"]
+                    if file_path not in snippet_cache:
+                        snippet_cache[file_path] = _fetch_file_from_github(repo_url, branch, file_path)
+                    file_lines = snippet_cache[file_path]
+                    if file_lines and line_num > 0:
+                        ctx = 3
+                        s = max(0, line_num - 1 - ctx)
+                        e = min(len(file_lines), line_num + ctx)
+                        snippet_lines = file_lines[s:e]
+                        if f["scan_type"] == "gitleaks":
+                            tidx = line_num - 1 - s
+                            if 0 <= tidx < len(snippet_lines):
+                                snippet_lines[tidx] = re.sub(
+                                    r'["\']([^"\']{4,})["\']',
+                                    lambda mx: '"****"',
+                                    snippet_lines[tidx]
+                                )
+                        code_snippet = "\n".join(snippet_lines)
+
+                    session.add(SecurityFinding(
+                        job_id=job_id, step_id=f["step_id"],
+                        scan_type=f["scan_type"], severity=f["severity"],
+                        rule_id=f["rule_id"], rule_name=f["rule_id"],
+                        file_path=f["file_path"], line_number=f["line_number"],
+                        message=f["message"], is_masked=f["scan_type"] == "gitleaks",
+                        ai_fix_suggestion=ai_fix, code_snippet=code_snippet,
+                    ))
 
             total_findings = gitleaks_count + semgrep_count
 
