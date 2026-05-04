@@ -366,6 +366,10 @@ async def _save_parsed_data_to_db(job_id: str, obj: dict) -> None:
                         if row and row[0]:
                             ai_fix = row[0]
 
+                    # code_snippet: 엔진이 보낸 것을 취약점 줄 기준 앞뒤 3줄로 트림
+                    raw_snippet = f.get("code_snippet")
+                    trimmed_snippet = _trim_snippet(raw_snippet, f.get("line_number", 0), f.get("code_snippet_start_line", 1))
+
                     session.add(SecurityFinding(
                         job_id=job_id,
                         step_id=step_id,
@@ -378,7 +382,7 @@ async def _save_parsed_data_to_db(job_id: str, obj: dict) -> None:
                         message=(f.get("message", "") or "")[:2000],
                         is_masked=scan_type == "gitleaks",
                         ai_fix_suggestion=ai_fix,
-                        code_snippet=f.get("code_snippet"),
+                        code_snippet=trimmed_snippet,
                     ))
 
             else:
@@ -595,6 +599,20 @@ def _fetch_file_from_github(repo_url: str, branch: str, file_path: str) -> list[
         return content.splitlines()
     except Exception:
         return None
+
+
+def _trim_snippet(raw_snippet: str | None, line_number: int, snippet_start_line: int, context: int = 1) -> str | None:
+    """엔진이 보낸 긴 snippet을 취약점 줄 기준 앞뒤 context줄로 잘라서 반환."""
+    if not raw_snippet or line_number <= 0:
+        return raw_snippet
+    lines = raw_snippet.splitlines()
+    # 취약점 줄이 snippet 내에서 몇 번째 인덱스인지
+    target_idx = line_number - snippet_start_line
+    if target_idx < 0 or target_idx >= len(lines):
+        return raw_snippet  # 계산 불가하면 원본 반환
+    start = max(0, target_idx - context)
+    end = min(len(lines), target_idx + context + 1)
+    return "\n".join(lines[start:end])
 
 
 def _normalize_severity(raw: str) -> str:
