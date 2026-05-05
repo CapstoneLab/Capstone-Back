@@ -366,9 +366,11 @@ async def _save_parsed_data_to_db(job_id: str, obj: dict) -> None:
                         if row and row[0]:
                             ai_fix = row[0]
 
-                    # code_snippet: 엔진이 보낸 것을 취약점 줄 기준 앞뒤 3줄로 트림
+                    # code_snippet: 취약점 줄 기준 앞뒤 2줄(총 5줄)로 트림
                     raw_snippet = f.get("code_snippet")
-                    trimmed_snippet = _trim_snippet(raw_snippet, f.get("line_number", 0), f.get("code_snippet_start_line", 1))
+                    trimmed_snippet, trimmed_start = _trim_snippet(
+                        raw_snippet, f.get("line_number", 0), f.get("code_snippet_start_line", 1)
+                    )
 
                     session.add(SecurityFinding(
                         job_id=job_id,
@@ -379,6 +381,7 @@ async def _save_parsed_data_to_db(job_id: str, obj: dict) -> None:
                         rule_name=f.get("title") or f.get("rule_id", ""),
                         file_path=f.get("file_path", ""),
                         line_number=f.get("line_number", 0),
+                        column_number=f.get("column_number"),
                         message=(f.get("message", "") or "")[:2000],
                         is_masked=scan_type == "gitleaks",
                         ai_fix_suggestion=ai_fix,
@@ -601,18 +604,18 @@ def _fetch_file_from_github(repo_url: str, branch: str, file_path: str) -> list[
         return None
 
 
-def _trim_snippet(raw_snippet: str | None, line_number: int, snippet_start_line: int, context: int = 1) -> str | None:
-    """엔진이 보낸 긴 snippet을 취약점 줄 기준 앞뒤 context줄로 잘라서 반환."""
+def _trim_snippet(raw_snippet: str | None, line_number: int, snippet_start_line: int, context: int = 2) -> tuple[str | None, int | None]:
+    """엔진이 보낸 긴 snippet을 취약점 줄 기준 앞뒤 context줄로 잘라서 (snippet, start_line) 반환."""
     if not raw_snippet or line_number <= 0:
-        return raw_snippet
+        return raw_snippet, snippet_start_line if raw_snippet else None
     lines = raw_snippet.splitlines()
-    # 취약점 줄이 snippet 내에서 몇 번째 인덱스인지
     target_idx = line_number - snippet_start_line
     if target_idx < 0 or target_idx >= len(lines):
-        return raw_snippet  # 계산 불가하면 원본 반환
+        return raw_snippet, snippet_start_line
     start = max(0, target_idx - context)
     end = min(len(lines), target_idx + context + 1)
-    return "\n".join(lines[start:end])
+    trimmed_start_line = snippet_start_line + start
+    return "\n".join(lines[start:end]), trimmed_start_line
 
 
 def _normalize_severity(raw: str) -> str:
@@ -873,11 +876,12 @@ async def get_job_findings(job_id: str) -> dict:
             )
             findings = []
             for f in result.scalars().all():
-                # code_snippet_start_line 계산
+                # code_snippet_start_line: 취약점 줄에서 앞 2줄 뺀 위치 (최소 1)
                 snippet_start = None
                 if f.code_snippet and f.line_number:
-                    snippet_lines = f.code_snippet.count("\n")
-                    snippet_start = max(1, f.line_number - (snippet_lines // 2))
+                    snippet_line_count = f.code_snippet.count("\n") + 1
+                    lines_before = (snippet_line_count - 1) // 2  # 취약점 줄 앞에 몇 줄 있는지
+                    snippet_start = max(1, f.line_number - lines_before)
 
                 findings.append({
                     "finding_id": f.finding_id,
