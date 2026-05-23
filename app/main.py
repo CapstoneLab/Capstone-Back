@@ -53,12 +53,10 @@ app = FastAPI(
     root_path=os.getenv("ROOT_PATH", ""),
 )
 
-_frontend_origin = os.getenv("FRONTEND_ORIGIN", "")
-_cors_origins = [o for o in ["http://localhost:5173", "http://localhost:3000", _frontend_origin] if o]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins,
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
