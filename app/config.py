@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     jwt_algorithm: str = Field(default="HS256", alias="JWT_ALGORITHM")
     jwt_expire_minutes: int = Field(default=60 * 24 * 7, alias="JWT_EXPIRE_MINUTES")
     token_encryption_key: str = Field(default="", alias="TOKEN_ENCRYPTION_KEY")
+    frontend_origin: str = Field(default="", alias="FRONTEND_ORIGIN")
 
 
 @lru_cache

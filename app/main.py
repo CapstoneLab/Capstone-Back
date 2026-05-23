@@ -5,7 +5,8 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
-from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import func, select, update
 
 from app.api.repos_router import router as repos_router
@@ -51,6 +52,44 @@ app = FastAPI(
     lifespan=lifespan,
     root_path=os.getenv("ROOT_PATH", ""),
 )
+
+_frontend_origin = os.getenv("FRONTEND_ORIGIN", "")
+_cors_origins = [o for o in ["http://localhost:5173", "http://localhost:3000", _frontend_origin] if o]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(_, exc: HTTPException) -> JSONResponse:
+    """에러 응답을 프론트 명세 형식으로 통일: {error, detail, message}"""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": _status_to_error_code(exc.status_code),
+            "detail": exc.detail,
+            "message": exc.detail,
+        },
+    )
+
+
+def _status_to_error_code(code: int) -> str:
+    return {
+        400: "BAD_REQUEST",
+        401: "UNAUTHORIZED",
+        403: "FORBIDDEN",
+        404: "NOT_FOUND",
+        409: "CONFLICT",
+        500: "INTERNAL_SERVER_ERROR",
+        502: "BAD_GATEWAY",
+        504: "GATEWAY_TIMEOUT",
+    }.get(code, "ERROR")
+
+
 app.include_router(auth_router)
 app.include_router(repos_router)
 
@@ -935,12 +974,36 @@ async def create_pipeline(
     current_user: dict = Depends(get_current_user),
 ) -> dict:
     """파이프라인 시작 (JWT 인증 필요). 202 Accepted 반환."""
+    repo_url = str(req.repo_url)
+
+    # 409: 동일 repo+branch가 이미 running/queued이면 중복 실행 방지
+    try:
+        async with SessionLocal() as session:
+            conflict = await session.execute(
+                select(PipelineJob.job_id)
+                .where(
+                    PipelineJob.repo_url == repo_url,
+                    PipelineJob.branch == req.branch,
+                    PipelineJob.status.in_(["queued", "running"]),
+                )
+                .limit(1)
+            )
+            if conflict.first():
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{repo_url} ({req.branch}) 브랜치에 이미 실행 중인 파이프라인이 있습니다",
+                )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"[DB] conflict check failed: {exc}")
+
     job_id = str(uuid4())
     now = datetime.now(timezone.utc)
 
     job_state[job_id] = {
         "status": "queued",
-        "repo_url": str(req.repo_url),
+        "repo_url": repo_url,
         "branch": req.branch,
         "requested_at": now.isoformat(),
     }
@@ -949,7 +1012,7 @@ async def create_pipeline(
         async with SessionLocal() as session:
             job = PipelineJob(
                 job_id=job_id,
-                repo_url=str(req.repo_url),
+                repo_url=repo_url,
                 branch=req.branch,
                 trigger_source=req.trigger_source,
                 status="queued",
@@ -961,7 +1024,7 @@ async def create_pipeline(
         print(f"[DB] pipeline_jobs INSERT failed: {exc}")
 
     try:
-        trigger_service.trigger(job_id=job_id, repo_url=str(req.repo_url), branch=req.branch, env_vars=req.env_vars)
+        trigger_service.trigger(job_id=job_id, repo_url=repo_url, branch=req.branch, env_vars=req.env_vars)
         job_state[job_id]["status"] = "triggered"
         try:
             async with SessionLocal() as session:
@@ -982,12 +1045,16 @@ async def create_pipeline(
                 await session.commit()
         except Exception:
             pass
-        raise HTTPException(status_code=500, detail=f"failed to trigger ubuntu pipeline: {exc}") from exc
+        err_str = str(exc)
+        # DNS/연결 실패 → 502, 타임아웃 → 504
+        if "timed out" in err_str.lower() or "timeout" in err_str.lower():
+            raise HTTPException(status_code=504, detail=f"우분투 러너 응답 타임아웃: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"우분투 러너 호출 실패: {exc}") from exc
 
     return {
         "job_id": job_id,
         "status": "queued",
-        "message": "pipeline was triggered on ubuntu",
+        "message": "파이프라인이 큐에 등록되었습니다",
     }
 
 
