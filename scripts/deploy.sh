@@ -127,12 +127,11 @@ if [ "$RUNTIME" = "python" ]; then
   # Detect FastAPI (uvicorn) vs Flask/Django (gunicorn)
   if grep -q "fastapi\|FastAPI" requirements.txt 2>/dev/null || grep -q "uvicorn" requirements.txt 2>/dev/null; then
     # FastAPI → uvicorn
-    # Find the app module (app.main:app, main:app, etc.)
     APP_MODULE="app.main:app"
     if [ -f "main.py" ] && ! [ -d "app" ]; then
       APP_MODULE="main:app"
     fi
-    pm2 start "$PYTHON_BIN -m uvicorn ${APP_MODULE} --host 0.0.0.0 --port ${PORT} --root-path /${OWNER}/${REPO}" \
+    pm2 start "bash -c 'set -a && source ${APP_DIR}/source/.env && set +a && ${PYTHON_BIN} -m uvicorn ${APP_MODULE} --host 0.0.0.0 --port ${PORT} --root-path /${OWNER}/${REPO}'" \
       --name "$PM2_NAME" \
       --interpreter none
   else
@@ -144,7 +143,7 @@ if [ "$RUNTIME" = "python" ]; then
         break
       fi
     done
-    pm2 start "$PYTHON_BIN -m gunicorn ${WSGI_APP} -b 0.0.0.0:${PORT}" \
+    pm2 start "bash -c 'set -a && source ${APP_DIR}/source/.env && set +a && ${PYTHON_BIN} -m gunicorn ${WSGI_APP} -b 0.0.0.0:${PORT}'" \
       --name "$PM2_NAME" \
       --interpreter none
   fi
