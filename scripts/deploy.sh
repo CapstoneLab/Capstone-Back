@@ -188,6 +188,14 @@ location /${OWNER}/${REPO} {
     return 301 /${OWNER}/${REPO}/;
 }
 location /${OWNER}/${REPO}/ {
+    if (\$request_method = OPTIONS) {
+        add_header Access-Control-Allow-Origin *;
+        add_header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS";
+        add_header Access-Control-Allow-Headers "Authorization, Content-Type";
+        add_header Access-Control-Max-Age 86400;
+        return 204;
+    }
+
     proxy_pass http://127.0.0.1:${PORT}/;
     proxy_http_version 1.1;
     proxy_set_header Upgrade \$http_upgrade;
