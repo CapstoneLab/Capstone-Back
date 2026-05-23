@@ -75,6 +75,14 @@ jobs:
           DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_GITHUB_CLIENT_SECRET='${{ secrets.OAUTH_CLIENT_SECRET }}'"
           DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_JWT_SECRET='${{ secrets.JWT_SECRET }}'"
           DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_DATABASE_URL='${{ secrets.DATABASE_URL }}'"
+          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_UBUNTU_SSH_HOST='${{ secrets.UBUNTU_SSH_HOST }}'"
+          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_UBUNTU_SSH_PORT='${{ secrets.UBUNTU_SSH_PORT }}'"
+          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_UBUNTU_SSH_USER='${{ secrets.UBUNTU_SSH_USER }}'"
+          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_UBUNTU_SSH_PASSWORD='${{ secrets.UBUNTU_SSH_PASSWORD }}'"
+          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_UBUNTU_RUNNER_PATH='${{ secrets.UBUNTU_RUNNER_PATH }}'"
+          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_UBUNTU_WORKING_DIR='${{ secrets.UBUNTU_WORKING_DIR }}'"
+          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_UBUNTU_PYTHON_COMMAND='${{ secrets.UBUNTU_PYTHON_COMMAND }}'"
+          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_WINDOWS_CALLBACK_BASE_URL='${{ secrets.WINDOWS_CALLBACK_BASE_URL }}'"
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
