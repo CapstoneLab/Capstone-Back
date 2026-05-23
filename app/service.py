@@ -90,6 +90,10 @@ class ResultStore:
             return None
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def delete(self, job_id: str) -> None:
+        path = self.base_dir / f"{job_id}.json"
+        path.unlink(missing_ok=True)
+
 
 class UbuntuResultFetcher:
     def __init__(self) -> None:
@@ -159,6 +163,21 @@ class UbuntuResultFetcher:
             return raw.splitlines()
         except Exception:
             return []
+
+    def kill_job(self, job_id: str) -> bool:
+        """SSH로 접속해 job_id에 해당하는 프로세스를 kill. 성공 여부 반환."""
+        try:
+            ssh = self._connect_ssh()
+            # job_id가 포함된 프로세스(python runner)를 찾아 SIGKILL
+            kill_cmd = f"pkill -9 -f {shlex.quote(job_id)} 2>/dev/null; rm -f /tmp/ci_runner_{shlex.quote(job_id)}.log 2>/dev/null; true"
+            _, stdout, _ = ssh.exec_command(kill_cmd, timeout=10)
+            stdout.channel.recv_exit_status()
+            ssh.close()
+            print(f"[kill] sent SIGKILL for job_id={job_id}")
+            return True
+        except Exception as exc:
+            print(f"[kill] failed to kill job_id={job_id}: {exc}")
+            return False
 
     def fetch_result_by_job_id(self, job_id: str, scan_limit: int = 60) -> dict | None:
         if not job_id:

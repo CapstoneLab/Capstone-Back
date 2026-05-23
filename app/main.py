@@ -991,6 +991,76 @@ async def create_pipeline(
     }
 
 
+@app.post("/api/pipelines/{job_id}/cancel")
+async def cancel_pipeline(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """실행 중인 파이프라인 취소. 우분투 프로세스를 kill하고 DB status를 cancelled로 변경."""
+    async with SessionLocal() as session:
+        job = await session.get(PipelineJob, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="job not found")
+        if job.status not in ("queued", "running"):
+            raise HTTPException(status_code=409, detail=f"job is already {job.status}, cannot cancel")
+
+        # 우분투 프로세스 kill (실패해도 DB는 cancelled로 업데이트)
+        killed = result_fetcher.kill_job(job_id)
+
+        now = datetime.now(timezone.utc)
+        await session.execute(
+            update(PipelineJob)
+            .where(PipelineJob.job_id == job_id)
+            .values(status="cancelled", completed_at=now)
+        )
+        await session.commit()
+
+    job_state.pop(job_id, None)
+    job_steps.pop(job_id, None)
+
+    return {
+        "job_id": job_id,
+        "status": "cancelled",
+        "killed": killed,
+        "message": "파이프라인이 취소되었습니다",
+    }
+
+
+@app.delete("/api/pipelines/{job_id}")
+async def delete_pipeline(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """파이프라인 job 삭제. 실행 중이면 먼저 kill 후 DB에서 제거."""
+    async with SessionLocal() as session:
+        job = await session.get(PipelineJob, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="job not found")
+
+        # 실행 중이면 우분투 프로세스도 kill
+        if job.status in ("queued", "running"):
+            result_fetcher.kill_job(job_id)
+
+        # 연관 데이터 cascade 삭제 (DB에 ON DELETE CASCADE 없으면 수동 삭제)
+        from sqlalchemy import text as sa_text
+        await session.execute(sa_text("DELETE FROM step_logs WHERE job_id = :jid"), {"jid": job_id})
+        await session.execute(sa_text("DELETE FROM security_findings WHERE job_id = :jid"), {"jid": job_id})
+        await session.execute(sa_text("DELETE FROM security_summary WHERE job_id = :jid"), {"jid": job_id})
+        await session.execute(sa_text("DELETE FROM deployments WHERE job_id = :jid"), {"jid": job_id})
+        await session.execute(sa_text("DELETE FROM build_artifacts WHERE job_id = :jid"), {"jid": job_id})
+        await session.execute(sa_text("DELETE FROM pipeline_steps WHERE job_id = :jid"), {"jid": job_id})
+        await session.execute(sa_text("DELETE FROM pipeline_jobs WHERE job_id = :jid"), {"jid": job_id})
+        await session.commit()
+
+    job_state.pop(job_id, None)
+    job_steps.pop(job_id, None)
+
+    # 로컬 result 파일도 삭제
+    result_store.delete(job_id)
+
+    return {"job_id": job_id, "deleted": True, "message": "파이프라인이 삭제되었습니다"}
+
+
 @app.get("/api/pipelines/{job_id}/logs")
 async def get_pipeline_logs(job_id: str) -> dict:
     """파이프라인 로그 조회 (path parameter)."""
