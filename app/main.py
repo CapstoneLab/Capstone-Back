@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from sqlalchemy import func, select, update
 
 from app.api.repos_router import router as repos_router
@@ -196,14 +197,18 @@ async def _ensure_job_exists(payload: PipelineResultPayload) -> None:
         async with SessionLocal() as session:
             existing = await session.get(PipelineJob, payload.job_id)
             if not existing:
+                now = datetime.now(timezone.utc)
+                started_at = payload.started_at or now
+                if started_at < now:
+                    started_at = now
                 job = PipelineJob(
                     job_id=payload.job_id,
                     repo_url=payload.repo_url,
                     branch=payload.branch,
                     trigger_source="callback",
                     status="running",
-                    started_at=payload.started_at or datetime.now(timezone.utc),
-                    created_at=datetime.now(timezone.utc),
+                    started_at=started_at,
+                    created_at=now,
                 )
                 session.add(job)
                 await session.commit()
@@ -263,7 +268,13 @@ async def _finalize_job_in_db(payload: PipelineResultPayload, obj: dict) -> None
             overall = "success" if final_status == "success" else "failed"
 
             # 시작/종료 시간 계산
+            # started_at은 DB의 created_at보다 이전일 수 없으므로 job을 먼저 조회
+            job = await session.get(PipelineJob, payload.job_id)
+            created_at = job.created_at if job else now
+
             started = payload.started_at
+            if started and started < created_at:
+                started = created_at
             ended = payload.ended_at or now
             duration = None
             if started and ended:
@@ -935,3 +946,137 @@ def get_result(job_id: str = Query(..., min_length=1)) -> PipelineResultResponse
         return PipelineResultResponse(found=False, data=None, message="result not found yet")
 
     return PipelineResultResponse(found=True, data=PipelineResultPayload(**data), message="ok")
+
+
+@app.get("/monitor", response_class=HTMLResponse)
+async def monitor_page() -> HTMLResponse:
+    """최근 job 목록과 콜백/DB 데이터를 한눈에 볼 수 있는 모니터링 페이지."""
+    try:
+        async with SessionLocal() as session:
+            jobs_result = await session.execute(
+                select(PipelineJob)
+                .order_by(PipelineJob.created_at.desc())
+                .limit(20)
+            )
+            jobs = jobs_result.scalars().all()
+
+            rows = []
+            for job in jobs:
+                steps_result = await session.execute(
+                    select(PipelineStep)
+                    .where(PipelineStep.job_id == job.job_id)
+                    .order_by(PipelineStep.started_at)
+                )
+                steps = steps_result.scalars().all()
+
+                summary_result = await session.execute(
+                    select(SecuritySummary).where(SecuritySummary.job_id == job.job_id)
+                )
+                summary = summary_result.scalar()
+
+                findings_count = await session.execute(
+                    select(func.count()).where(SecurityFinding.job_id == job.job_id)
+                )
+                f_count = findings_count.scalar()
+
+                rows.append({
+                    "job": job,
+                    "steps": steps,
+                    "summary": summary,
+                    "findings_count": f_count,
+                })
+
+    except Exception as exc:
+        return HTMLResponse(f"<pre>DB 오류: {exc}</pre>", status_code=500)
+
+    def status_badge(s):
+        color = {"success": "#22c55e", "failed": "#ef4444", "running": "#f59e0b",
+                 "queued": "#6b7280", "skipped": "#94a3b8"}.get(s, "#6b7280")
+        return f'<span style="background:{color};color:#fff;padding:2px 8px;border-radius:12px;font-size:12px">{s}</span>'
+
+    def fmt_time(dt):
+        if not dt:
+            return "-"
+        return dt.strftime("%m-%d %H:%M:%S")
+
+    job_rows_html = ""
+    for r in rows:
+        job = r["job"]
+        summary = r["summary"]
+        steps = r["steps"]
+        f_count = r["findings_count"]
+
+        step_pills = ""
+        for s in steps:
+            color = {"success": "#22c55e", "failed": "#ef4444", "skipped": "#94a3b8", "running": "#f59e0b"}.get(s.status, "#6b7280")
+            step_pills += f'<span style="background:{color};color:#fff;padding:1px 6px;border-radius:8px;font-size:11px;margin:1px">{s.step_name}</span> '
+
+        if summary:
+            sec_html = f"""
+            <div style="font-size:12px;margin-top:4px">
+                {status_badge(summary.overall_status)}
+                <span style="margin-left:6px">총 {summary.total_findings}건
+                | 🔴 {summary.critical_count}
+                | 🟠 {summary.high_count}
+                | 🟡 {summary.medium_count}
+                | 🟢 {summary.low_count}</span>
+            </div>"""
+        else:
+            sec_html = '<div style="font-size:12px;color:#94a3b8;margin-top:4px">보안 스캔 없음</div>'
+
+        job_rows_html += f"""
+        <tr>
+            <td style="padding:10px;font-size:12px;font-family:monospace;color:#94a3b8">{str(job.job_id)[:8]}…</td>
+            <td style="padding:10px;font-size:12px">{job.repo_url.split('github.com/')[-1] if job.repo_url else '-'}<br>
+                <span style="color:#94a3b8">{job.branch}</span></td>
+            <td style="padding:10px">{status_badge(job.status)}</td>
+            <td style="padding:10px;font-size:12px">{fmt_time(job.created_at)}</td>
+            <td style="padding:10px;font-size:12px">{fmt_time(job.completed_at)}</td>
+            <td style="padding:10px;font-size:12px">{int(job.duration_secs) if job.duration_secs else '-'}s</td>
+            <td style="padding:10px">{step_pills or '<span style="color:#94a3b8;font-size:12px">없음</span>'}</td>
+            <td style="padding:10px">
+                <span style="font-size:13px;font-weight:600">{f_count}건</span>
+                {sec_html}
+            </td>
+        </tr>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="refresh" content="10">
+<title>CI/CD 모니터</title>
+<style>
+  body {{ font-family: -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 20px; }}
+  h1 {{ font-size: 20px; margin-bottom: 4px; }}
+  .subtitle {{ color: #64748b; font-size: 13px; margin-bottom: 20px; }}
+  table {{ width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 10px; overflow: hidden; }}
+  th {{ background: #334155; padding: 10px; text-align: left; font-size: 12px; color: #94a3b8; text-transform: uppercase; }}
+  tr:nth-child(even) {{ background: #172033; }}
+  tr:hover {{ background: #263348; }}
+  .refresh {{ float: right; font-size: 12px; color: #64748b; }}
+</style>
+</head>
+<body>
+<h1>CI/CD 파이프라인 모니터</h1>
+<div class="subtitle">최근 20개 job · 10초마다 자동 갱신 <span class="refresh">갱신: {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC</span></div>
+<table>
+  <thead>
+    <tr>
+      <th>Job ID</th>
+      <th>Repo / Branch</th>
+      <th>Status</th>
+      <th>시작</th>
+      <th>완료</th>
+      <th>소요</th>
+      <th>Steps</th>
+      <th>보안 결과 (Findings)</th>
+    </tr>
+  </thead>
+  <tbody>
+    {job_rows_html if job_rows_html else '<tr><td colspan="8" style="padding:20px;text-align:center;color:#64748b">아직 job이 없습니다</td></tr>'}
+  </tbody>
+</table>
+</body>
+</html>"""
+    return HTMLResponse(html)
