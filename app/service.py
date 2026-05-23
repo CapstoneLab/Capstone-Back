@@ -34,10 +34,15 @@ class TriggerService:
             f"setsid nohup bash -lc {shlex.quote(remote_cmd)} "
             f">{shlex.quote(log_file)} 2>&1 </dev/null &"
         )
+        print(f"[DEBUG SSH cmd] {bg_cmd}")
 
         try:
-            _, stdout, _ = ssh.exec_command(bg_cmd, timeout=10)
-            stdout.channel.recv_exit_status()
+            _, stdout, stderr = ssh.exec_command(bg_cmd, timeout=10)
+            exit_code = stdout.channel.recv_exit_status()
+            err_out = stderr.read().decode("utf-8", errors="replace").strip()
+            print(f"[DEBUG SSH exit_code] {exit_code}")
+            if err_out:
+                print(f"[DEBUG SSH stderr] {err_out}")
         finally:
             ssh.close()
 
