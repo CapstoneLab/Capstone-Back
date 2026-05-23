@@ -4,11 +4,12 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.responses import HTMLResponse
 from sqlalchemy import func, select, update
 
 from app.api.repos_router import router as repos_router
+from app.auth.jwt_utils import get_current_user
 from app.auth.router import router as auth_router
 from app.db import Base, SessionLocal, engine
 from app.db_models import (  # noqa: F401
@@ -922,6 +923,133 @@ def pipeline_logs(job_id: str = Query(..., min_length=1)) -> dict:
 
 @app.get("/pipeline-steps")
 def pipeline_steps(job_id: str = Query(..., min_length=1)) -> dict:
+    steps = job_steps.get(job_id, [])
+    return {"job_id": job_id, "steps": steps}
+
+
+# ── /api/pipelines — 프론트엔드 API 스펙 ─────────────────────────────────────
+
+@app.post("/api/pipelines", status_code=status.HTTP_202_ACCEPTED)
+async def create_pipeline(
+    req: StartPipelineRequest,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """파이프라인 시작 (JWT 인증 필요). 202 Accepted 반환."""
+    job_id = str(uuid4())
+    now = datetime.now(timezone.utc)
+
+    job_state[job_id] = {
+        "status": "queued",
+        "repo_url": str(req.repo_url),
+        "branch": req.branch,
+        "requested_at": now.isoformat(),
+    }
+
+    try:
+        async with SessionLocal() as session:
+            job = PipelineJob(
+                job_id=job_id,
+                repo_url=str(req.repo_url),
+                branch=req.branch,
+                trigger_source=req.trigger_source,
+                status="queued",
+                created_at=now,
+            )
+            session.add(job)
+            await session.commit()
+    except Exception as exc:
+        print(f"[DB] pipeline_jobs INSERT failed: {exc}")
+
+    try:
+        trigger_service.trigger(job_id=job_id, repo_url=str(req.repo_url), branch=req.branch, env_vars=req.env_vars)
+        job_state[job_id]["status"] = "triggered"
+        try:
+            async with SessionLocal() as session:
+                await session.execute(
+                    update(PipelineJob).where(PipelineJob.job_id == job_id).values(status="running", started_at=datetime.now(timezone.utc))
+                )
+                await session.commit()
+        except Exception:
+            pass
+    except Exception as exc:
+        job_state[job_id]["status"] = "failed_to_trigger"
+        job_state[job_id]["error"] = str(exc)
+        try:
+            async with SessionLocal() as session:
+                await session.execute(
+                    update(PipelineJob).where(PipelineJob.job_id == job_id).values(status="failed")
+                )
+                await session.commit()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"failed to trigger ubuntu pipeline: {exc}") from exc
+
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "message": "pipeline was triggered on ubuntu",
+    }
+
+
+@app.get("/api/pipelines/{job_id}/logs")
+async def get_pipeline_logs(job_id: str) -> dict:
+    """파이프라인 로그 조회 (path parameter)."""
+    try:
+        async with SessionLocal() as session:
+            result = await session.execute(
+                select(PipelineStep.step_name, StepLog.log_content, StepLog.log_level)
+                .join(StepLog, StepLog.step_id == PipelineStep.step_id)
+                .where(StepLog.job_id == job_id)
+                .order_by(PipelineStep.created_at)
+            )
+            rows = result.all()
+
+        if rows:
+            lines = []
+            for step_name, log_content, _ in rows:
+                if log_content:
+                    for line in log_content.splitlines():
+                        lines.append(f"[{step_name}.log] {line}")
+            return {"job_id": job_id, "lines": lines}
+    except Exception as exc:
+        print(f"[pipeline logs] DB query failed: {exc}")
+
+    # fallback: 메모리/파일에서 조회
+    lines = result_fetcher.fetch_log_lines(job_id)
+    return {"job_id": job_id, "lines": lines}
+
+
+@app.get("/api/pipelines/{job_id}/steps")
+async def get_pipeline_steps(job_id: str) -> dict:
+    """파이프라인 step 목록 조회 (path parameter)."""
+    try:
+        async with SessionLocal() as session:
+            result = await session.execute(
+                select(PipelineStep)
+                .where(PipelineStep.job_id == job_id)
+                .order_by(PipelineStep.created_at)
+            )
+            steps_list = []
+            for step in result.scalars().all():
+                duration = step.duration_secs
+                if duration is None and step.started_at and step.ended_at:
+                    duration = round((step.ended_at - step.started_at).total_seconds(), 2)
+                steps_list.append({
+                    "step_id": step.step_id,
+                    "step_name": step.step_name,
+                    "step_type": step.step_type,
+                    "status": step.status,
+                    "error_message": step.error_message,
+                    "started_at": step.started_at.isoformat() if step.started_at else None,
+                    "ended_at": step.ended_at.isoformat() if step.ended_at else None,
+                    "duration_secs": duration,
+                })
+        if steps_list:
+            return {"job_id": job_id, "steps": steps_list}
+    except Exception as exc:
+        print(f"[pipeline steps] DB query failed: {exc}")
+
+    # fallback: 메모리에서 조회
     steps = job_steps.get(job_id, [])
     return {"job_id": job_id, "steps": steps}
 
