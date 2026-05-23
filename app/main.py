@@ -1191,6 +1191,147 @@ async def get_pipeline_steps(job_id: str) -> dict:
     return {"job_id": job_id, "steps": steps}
 
 
+@app.get("/api/jobs/{job_id}/result")
+async def get_job_result(
+    job_id: str,
+    severity: str | None = Query(None, description="comma-separated: critical,high,medium,low"),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """보안 분석 상세 결과 (findings 리스트 + AI 제안 포함)."""
+    try:
+        async with SessionLocal() as session:
+            job = await session.get(PipelineJob, job_id)
+            if not job:
+                raise HTTPException(status_code=404, detail="job not found")
+
+            # 진행 중인 job은 빈 findings 반환
+            if job.status in ("queued", "running"):
+                return {
+                    "job_id": job_id,
+                    "repo_url": job.repo_url,
+                    "branch": job.branch,
+                    "completed_at": None,
+                    "scores": {"security_score": 0, "code_quality_score": 0},
+                    "verdict": {"overall_status": "pending", "status_reason": "파이프라인 실행 중", "total_findings": 0},
+                    "severity_summary": {"critical": 0, "high": 0, "medium": 0, "low": 0},
+                    "scanner_summaries": [],
+                    "findings": [],
+                    "pagination": {"total": 0, "limit": limit, "offset": offset, "has_more": False},
+                }
+
+            # security_summary
+            summary_result = await session.execute(
+                select(SecuritySummary).where(SecuritySummary.job_id == job_id)
+            )
+            summary = summary_result.scalar()
+
+            # findings 쿼리
+            sev_filter = []
+            if severity:
+                sev_filter = [s.strip() for s in severity.split(",") if s.strip()]
+
+            findings_query = select(SecurityFinding).where(SecurityFinding.job_id == job_id)
+            if sev_filter:
+                findings_query = findings_query.where(SecurityFinding.severity.in_(sev_filter))
+            findings_query = findings_query.order_by(
+                SecurityFinding.severity,
+                SecurityFinding.created_at,
+            )
+
+            total_result = await session.execute(
+                select(func.count()).select_from(
+                    findings_query.subquery()
+                )
+            )
+            total = total_result.scalar() or 0
+
+            findings_result = await session.execute(
+                findings_query.offset(offset).limit(limit)
+            )
+            findings = findings_result.scalars().all()
+
+            # scanner별 집계
+            scanner_map: dict[str, dict] = {}
+            for f in findings:
+                sc = f.scan_type
+                if sc not in scanner_map:
+                    scanner_map[sc] = {"scanner": sc, "count": 0, "critical": 0, "high": 0, "medium": 0, "low": 0}
+                scanner_map[sc]["count"] += 1
+                scanner_map[sc][f.severity] = scanner_map[sc].get(f.severity, 0) + 1
+
+            # security_score: findings 없으면 100, critical/high 가중치
+            sec_score = 100
+            if summary:
+                penalty = (summary.critical_count * 20 + summary.high_count * 10 +
+                           summary.medium_count * 3 + summary.low_count * 1)
+                sec_score = max(0, 100 - penalty)
+
+            findings_list = []
+            for f in findings:
+                # code_snippet_start_line 계산
+                snippet_start = None
+                if f.code_snippet and f.line_number:
+                    snippet_line_count = f.code_snippet.count("\n") + 1
+                    lines_before = (snippet_line_count - 1) // 2
+                    snippet_start = max(1, f.line_number - lines_before)
+
+                findings_list.append({
+                    "id": f.finding_id,
+                    "scanner": f.scan_type,
+                    "rule_id": f.rule_id,
+                    "cve": None,
+                    "cvss": str(f.cvss_score) if f.cvss_score else None,
+                    "cvss_version": None,
+                    "title": f.rule_name or f.rule_id,
+                    "severity": f.severity,
+                    "file_path": f.file_path,
+                    "line_start": f.line_number,
+                    "line_end": f.line_number,
+                    "code_snippet": f.code_snippet,
+                    "code_snippet_start_line": snippet_start,
+                    "description": f.message,
+                    "ai_suggestion": f.ai_fix_suggestion,
+                    "references": [],
+                })
+
+            return {
+                "job_id": job_id,
+                "repo_url": job.repo_url,
+                "branch": job.branch,
+                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+                "scores": {
+                    "security_score": sec_score,
+                    "code_quality_score": 100,
+                },
+                "verdict": {
+                    "overall_status": summary.overall_status if summary else "passed",
+                    "status_reason": summary.status_reason if summary else "no findings",
+                    "total_findings": summary.total_findings if summary else 0,
+                },
+                "severity_summary": {
+                    "critical": summary.critical_count if summary else 0,
+                    "high": summary.high_count if summary else 0,
+                    "medium": summary.medium_count if summary else 0,
+                    "low": summary.low_count if summary else 0,
+                },
+                "scanner_summaries": list(scanner_map.values()),
+                "findings": findings_list,
+                "pagination": {
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "has_more": (offset + limit) < total,
+                },
+            }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/get-results", response_model=PipelineResultResponse)
 def get_result(job_id: str = Query(..., min_length=1)) -> PipelineResultResponse:
     data = result_store.load(job_id)
