@@ -1021,8 +1021,14 @@ async def create_pipeline(
     except Exception as exc:
         print(f"[DB] pipeline_jobs INSERT failed: {exc}")
 
+    # selected_checks / is_first_run → 엔진 env_vars로 병합
+    merged_env = dict(req.env_vars or {})
+    if req.selected_checks:
+        merged_env["SELECTED_CHECKS"] = ",".join(req.selected_checks)
+    merged_env["IS_FIRST_RUN"] = "true" if req.is_first_run else "false"
+
     try:
-        trigger_service.trigger(job_id=job_id, repo_url=repo_url, branch=req.branch, env_vars=req.env_vars)
+        trigger_service.trigger(job_id=job_id, repo_url=repo_url, branch=req.branch, env_vars=merged_env)
         job_state[job_id]["status"] = "triggered"
         try:
             async with SessionLocal() as session:
@@ -1156,9 +1162,11 @@ async def get_pipeline_logs(job_id: str) -> dict:
 
 @app.get("/api/pipelines/{job_id}/steps")
 async def get_pipeline_steps(job_id: str) -> dict:
-    """파이프라인 step 목록 조회 (path parameter)."""
+    """파이프라인 step 목록 조회 (path parameter). job summary 필드 포함."""
     try:
         async with SessionLocal() as session:
+            job = await session.get(PipelineJob, job_id)
+
             result = await session.execute(
                 select(PipelineStep)
                 .where(PipelineStep.job_id == job_id)
@@ -1179,14 +1187,26 @@ async def get_pipeline_steps(job_id: str) -> dict:
                     "ended_at": step.ended_at.isoformat() if step.ended_at else None,
                     "duration_secs": duration,
                 })
-        if steps_list:
-            return {"job_id": job_id, "steps": steps_list}
+
+            job_summary = None
+            if job:
+                job_summary = {
+                    "status": job.status,
+                    "repo_url": job.repo_url,
+                    "branch": job.branch,
+                    "started_at": job.started_at.isoformat() if job.started_at else None,
+                    "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+                    "duration_secs": job.duration_secs,
+                }
+
+        if steps_list or job_summary:
+            return {"job_id": job_id, "job": job_summary, "steps": steps_list}
     except Exception as exc:
         print(f"[pipeline steps] DB query failed: {exc}")
 
     # fallback: 메모리에서 조회
     steps = job_steps.get(job_id, [])
-    return {"job_id": job_id, "steps": steps}
+    return {"job_id": job_id, "job": None, "steps": steps}
 
 
 @app.get("/api/jobs/{job_id}/result")

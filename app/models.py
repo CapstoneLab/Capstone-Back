@@ -7,8 +7,16 @@ from pydantic import BaseModel, Field, HttpUrl
 class StartPipelineRequest(BaseModel):
     repo_url: HttpUrl
     branch: str = "main"
-    trigger_source: str = "windows-api"
+    trigger_source: Literal["manual", "webhook", "windows-api"] = "windows-api"
     env_vars: dict[str, str] = Field(default_factory=dict)
+    selected_checks: list[str] = Field(
+        default_factory=list,
+        description="실행할 검사 항목 (예: ['build','lightweight-security','deep-security','deploy']). 비어 있으면 전체 실행.",
+    )
+    is_first_run: bool = Field(
+        default=False,
+        description="최초 실행 여부 플래그 (엔진에 IS_FIRST_RUN 환경변수로 전달).",
+    )
 
 
 class SecurityPayload(BaseModel):
