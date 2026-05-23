@@ -989,6 +989,9 @@ async def monitor_page() -> HTMLResponse:
     except Exception as exc:
         return HTMLResponse(f"<pre>DB 오류: {exc}</pre>", status_code=500)
 
+    from datetime import timedelta
+    KST = timezone(timedelta(hours=9))
+
     def status_badge(s):
         color = {"success": "#22c55e", "failed": "#ef4444", "running": "#f59e0b",
                  "queued": "#6b7280", "skipped": "#94a3b8"}.get(s, "#6b7280")
@@ -997,7 +1000,7 @@ async def monitor_page() -> HTMLResponse:
     def fmt_time(dt):
         if not dt:
             return "-"
-        return dt.strftime("%m-%d %H:%M:%S")
+        return dt.astimezone(KST).strftime("%m-%d %H:%M:%S")
 
     job_rows_html = ""
     for r in rows:
@@ -1059,7 +1062,7 @@ async def monitor_page() -> HTMLResponse:
 </head>
 <body>
 <h1>CI/CD 파이프라인 모니터</h1>
-<div class="subtitle">최근 20개 job · 10초마다 자동 갱신 <span class="refresh">갱신: {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC</span></div>
+<div class="subtitle">최근 20개 job · 10초마다 자동 갱신 <span class="refresh">갱신: {datetime.now(KST).strftime('%H:%M:%S')} KST</span></div>
 <table>
   <thead>
     <tr>
