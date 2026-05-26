@@ -70,6 +70,12 @@ class PipelineJob(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     duration_secs: Mapped[int | None] = mapped_column(Integer)
     metadata_: Mapped[dict | None] = mapped_column("metadata", JSONB, default=dict)
+    # 엔진 polling 지원 필드
+    source: Mapped[str] = mapped_column(String(50), nullable=False, default="capstone")
+    environment: Mapped[str] = mapped_column(String(50), nullable=False, default="development")
+    workflow_path: Mapped[str | None] = mapped_column(String(2048))
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claimed_by: Mapped[str | None] = mapped_column(String(255))
 
 
 class PipelineStep(Base):

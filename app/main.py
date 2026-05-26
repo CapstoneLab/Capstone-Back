@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import func, select, update
@@ -29,6 +29,7 @@ from app.models import (
     StartPipelineRequest,
     StartPipelineResponse,
 )
+from app.config import get_settings
 from app.service import ResultStore, TriggerService, UbuntuResultFetcher
 
 
@@ -1000,7 +1001,7 @@ async def create_pipeline(
     now = datetime.now(timezone.utc)
 
     job_state[job_id] = {
-        "status": "queued",
+        "status": "pending",
         "repo_url": repo_url,
         "branch": req.branch,
         "requested_at": now.isoformat(),
@@ -1014,51 +1015,21 @@ async def create_pipeline(
                 branch=req.branch,
                 trigger_source=req.trigger_source,
                 status="queued",
+                source=req.source,
+                environment=req.environment,
+                workflow_path=req.workflow_path,
                 created_at=now,
             )
             session.add(job)
             await session.commit()
+            print(f"[DB] pipeline_jobs INSERT (pending): {job_id}")
     except Exception as exc:
         print(f"[DB] pipeline_jobs INSERT failed: {exc}")
 
-    # selected_checks / is_first_run → 엔진 env_vars로 병합
-    merged_env = dict(req.env_vars or {})
-    if req.selected_checks:
-        merged_env["SELECTED_CHECKS"] = ",".join(req.selected_checks)
-    merged_env["IS_FIRST_RUN"] = "true" if req.is_first_run else "false"
-
-    try:
-        trigger_service.trigger(job_id=job_id, repo_url=repo_url, branch=req.branch, env_vars=merged_env)
-        job_state[job_id]["status"] = "triggered"
-        try:
-            async with SessionLocal() as session:
-                await session.execute(
-                    update(PipelineJob).where(PipelineJob.job_id == job_id).values(status="running", started_at=datetime.now(timezone.utc))
-                )
-                await session.commit()
-        except Exception:
-            pass
-    except Exception as exc:
-        job_state[job_id]["status"] = "failed_to_trigger"
-        job_state[job_id]["error"] = str(exc)
-        try:
-            async with SessionLocal() as session:
-                await session.execute(
-                    update(PipelineJob).where(PipelineJob.job_id == job_id).values(status="failed")
-                )
-                await session.commit()
-        except Exception:
-            pass
-        err_str = str(exc)
-        # DNS/연결 실패 → 502, 타임아웃 → 504
-        if "timed out" in err_str.lower() or "timeout" in err_str.lower():
-            raise HTTPException(status_code=504, detail=f"우분투 러너 응답 타임아웃: {exc}") from exc
-        raise HTTPException(status_code=502, detail=f"우분투 러너 호출 실패: {exc}") from exc
-
     return {
         "job_id": job_id,
-        "status": "queued",
-        "message": "파이프라인이 큐에 등록되었습니다",
+        "status": "pending",
+        "message": "파이프라인이 큐에 등록되었습니다. 엔진이 곧 가져갑니다.",
     }
 
 
@@ -1130,6 +1101,86 @@ async def delete_pipeline(
     result_store.delete(job_id)
 
     return {"job_id": job_id, "deleted": True, "message": "파이프라인이 삭제되었습니다"}
+
+
+# ── 엔진 polling API ──────────────────────────────────────────────────────────
+
+def _verify_engine_token(request: Request) -> None:
+    """x-engine-token 헤더 검증."""
+    settings = get_settings()
+    expected = settings.engine_shared_token
+    if not expected:
+        raise HTTPException(status_code=503, detail="ENGINE_SHARED_TOKEN not configured")
+    token = request.headers.get("x-engine-token", "")
+    if token != expected:
+        raise HTTPException(status_code=401, detail="Invalid engine token")
+
+
+def _job_to_engine_dict(job: PipelineJob) -> dict:
+    return {
+        "job_id": job.job_id,
+        "repo_url": job.repo_url,
+        "branch": job.branch,
+        "source": job.source,
+        "environment": job.environment,
+        "workflow_path": job.workflow_path,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+    }
+
+
+@app.get("/api/jobs/pending")
+async def get_pending_jobs(
+    request: Request,
+    limit: int = Query(10, ge=1, le=50),
+) -> dict:
+    """엔진이 polling해서 가져갈 pending 잡 목록. x-engine-token 인증 필요."""
+    _verify_engine_token(request)
+    try:
+        async with SessionLocal() as session:
+            result = await session.execute(
+                select(PipelineJob)
+                .where(PipelineJob.status == "queued")
+                .order_by(PipelineJob.created_at)
+                .limit(limit)
+            )
+            jobs = result.scalars().all()
+            return {"jobs": [_job_to_engine_dict(j) for j in jobs]}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/jobs/{job_id}/claim")
+async def claim_job(job_id: str, request: Request) -> dict:
+    """엔진이 잡을 가져갈 때 race condition 방지용 atomic claim.
+    x-engine-token 인증 필요. pending → running 전환."""
+    _verify_engine_token(request)
+    engine_id = request.headers.get("x-engine-id", "unknown")
+    try:
+        async with SessionLocal() as session:
+            job = await session.get(PipelineJob, job_id)
+            if not job:
+                raise HTTPException(status_code=404, detail="job not found")
+            if job.status != "queued":
+                raise HTTPException(status_code=409, detail=f"job is already {job.status}")
+
+            now = datetime.now(timezone.utc)
+            await session.execute(
+                update(PipelineJob)
+                .where(PipelineJob.job_id == job_id, PipelineJob.status == "queued")
+                .values(status="running", started_at=now, claimed_at=now, claimed_by=engine_id)
+            )
+            await session.commit()
+            await session.refresh(job)
+
+            if job.status != "running":
+                raise HTTPException(status_code=409, detail="claim failed, another engine got it first")
+
+            print(f"[engine] job claimed: {job_id} by {engine_id}")
+            return _job_to_engine_dict(job)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/pipelines/{job_id}/logs")

@@ -17,6 +17,9 @@ class StartPipelineRequest(BaseModel):
         default=False,
         description="최초 실행 여부 플래그 (엔진에 IS_FIRST_RUN 환경변수로 전달).",
     )
+    source: str = Field(default="capstone", description="엔진 소스 식별자 (capstone | mirae)")
+    environment: str = Field(default="development", description="실행 환경 (production | staging | development | feature)")
+    workflow_path: str | None = Field(default=None, description="커스텀 워크플로우 파일 경로")
 
 
 class SecurityPayload(BaseModel):
