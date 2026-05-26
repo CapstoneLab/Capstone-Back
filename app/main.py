@@ -110,14 +110,6 @@ async def start_pipeline(req: StartPipelineRequest) -> StartPipelineResponse:
     job_id = str(uuid4())
     now = datetime.now(timezone.utc)
 
-    job_state[job_id] = {
-        "status": "queued",
-        "repo_url": str(req.repo_url),
-        "branch": req.branch,
-        "requested_at": now.isoformat(),
-    }
-
-    # DB에 pipeline_jobs INSERT
     try:
         async with SessionLocal() as session:
             job = PipelineJob(
@@ -126,44 +118,28 @@ async def start_pipeline(req: StartPipelineRequest) -> StartPipelineResponse:
                 branch=req.branch,
                 trigger_source=req.trigger_source,
                 status="queued",
+                source=req.source,
+                environment=req.environment,
+                workflow_path=req.workflow_path,
                 created_at=now,
             )
             session.add(job)
             await session.commit()
-            print(f"[DB] pipeline_jobs INSERT: {job_id}")
+            print(f"[DB] pipeline_jobs INSERT (queued): {job_id}")
     except Exception as exc:
         print(f"[DB] pipeline_jobs INSERT failed: {exc}")
 
-    try:
-        trigger_service.trigger(job_id=job_id, repo_url=str(req.repo_url), branch=req.branch, env_vars=req.env_vars)
-        job_state[job_id]["status"] = "triggered"
-        # DB status 업데이트
-        try:
-            async with SessionLocal() as session:
-                await session.execute(
-                    update(PipelineJob).where(PipelineJob.job_id == job_id).values(status="running", started_at=datetime.now(timezone.utc))
-                )
-                await session.commit()
-        except Exception:
-            pass
-    except Exception as exc:
-        job_state[job_id]["status"] = "failed_to_trigger"
-        job_state[job_id]["error"] = str(exc)
-        # DB status 업데이트 (failed)
-        try:
-            async with SessionLocal() as session:
-                await session.execute(
-                    update(PipelineJob).where(PipelineJob.job_id == job_id).values(status="failed")
-                )
-                await session.commit()
-        except Exception:
-            pass
-        raise HTTPException(status_code=500, detail=f"failed to trigger ubuntu pipeline: {exc}") from exc
+    job_state[job_id] = {
+        "status": "queued",
+        "repo_url": str(req.repo_url),
+        "branch": req.branch,
+        "requested_at": now.isoformat(),
+    }
 
     return StartPipelineResponse(
         job_id=job_id,
-        status="triggered",
-        message="pipeline was triggered on ubuntu",
+        status="queued",
+        message="파이프라인이 큐에 등록되었습니다. 엔진이 곧 가져갑니다.",
     )
 
 
