@@ -604,19 +604,19 @@ async def _save_parsed_data_to_db(job_id: str, obj: dict) -> None:
                     VALUES
                         (gen_random_uuid(), :job_id, :total, :critical, :high, :medium, :low,
                          :gitleaks, :semgrep, :overall, :reason,
-                         :verdict, :score, :score_label, :gauge_color, :selected_items::jsonb, :selected_count,
-                         :out_of_scope, :requires_approval, :block_reasons::jsonb, :warn_reasons::jsonb, :score_breakdown::jsonb,
-                         :scanned_commit_sha, :acknowledged_cwes::jsonb)
+                         :verdict, :score, :score_label, :gauge_color, cast(:selected_items as jsonb), :selected_count,
+                         :out_of_scope, :requires_approval, cast(:block_reasons as jsonb), cast(:warn_reasons as jsonb), cast(:score_breakdown as jsonb),
+                         :scanned_commit_sha, cast(:acknowledged_cwes as jsonb))
                     ON CONFLICT (job_id) DO UPDATE SET
                         total_findings = :total, critical_count = :critical, high_count = :high,
                         medium_count = :medium, low_count = :low, gitleaks_count = :gitleaks,
                         semgrep_count = :semgrep, overall_status = :overall, status_reason = :reason,
                         verdict = :verdict, score = :score, score_label = :score_label,
-                        gauge_color = :gauge_color, selected_items = :selected_items::jsonb,
+                        gauge_color = :gauge_color, selected_items = cast(:selected_items as jsonb),
                         selected_count = :selected_count, out_of_scope_count = :out_of_scope,
-                        requires_approval = :requires_approval, block_reasons = :block_reasons::jsonb,
-                        warn_reasons = :warn_reasons::jsonb, score_breakdown = :score_breakdown::jsonb,
-                        scanned_commit_sha = :scanned_commit_sha, acknowledged_cwes = :acknowledged_cwes::jsonb,
+                        requires_approval = :requires_approval, block_reasons = cast(:block_reasons as jsonb),
+                        warn_reasons = cast(:warn_reasons as jsonb), score_breakdown = cast(:score_breakdown as jsonb),
+                        scanned_commit_sha = :scanned_commit_sha, acknowledged_cwes = cast(:acknowledged_cwes as jsonb),
                         calculated_at = CURRENT_TIMESTAMP
                 """), {
                     "job_id": job_id,
