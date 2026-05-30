@@ -78,6 +78,8 @@ class PipelineJob(Base):
     claimed_by: Mapped[str | None] = mapped_column(String(255))
     selected_items: Mapped[list | None] = mapped_column(JSONB, default=list)
     commit_sha: Mapped[str | None] = mapped_column(String(64))
+    approved_cwes: Mapped[list | None] = mapped_column(JSONB, default=list)
+    approval_record_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False))
 
 
 class PipelineStep(Base):
@@ -202,6 +204,8 @@ class SecuritySummary(Base):
     block_reasons: Mapped[list | None] = mapped_column(JSONB, default=list)
     warn_reasons: Mapped[list | None] = mapped_column(JSONB, default=list)
     score_breakdown: Mapped[dict | None] = mapped_column(JSONB, default=dict)
+    scanned_commit_sha: Mapped[str | None] = mapped_column(String(64))
+    acknowledged_cwes: Mapped[list | None] = mapped_column(JSONB, default=list)
     calculated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.current_timestamp())
 
 
@@ -226,4 +230,7 @@ class ApprovalRecord(Base):
     status: Mapped[str] = mapped_column(ApprovalStatus, nullable=False, default="pending")
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    scanned_commit_sha: Mapped[str | None] = mapped_column(String(64))
+    acknowledged_cwes: Mapped[list | None] = mapped_column(JSONB, default=list)
+    followup_job_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.current_timestamp())

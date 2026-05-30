@@ -554,6 +554,8 @@ async def _save_parsed_data_to_db(job_id: str, obj: dict) -> None:
                 eng_block_reasons = verdict_block.get("block_reasons", []) if isinstance(verdict_block, dict) else []
                 eng_warn_reasons = verdict_block.get("warn_reasons", []) if isinstance(verdict_block, dict) else []
                 eng_score_breakdown = verdict_block.get("score_breakdown", {}) if isinstance(verdict_block, dict) else {}
+                eng_scanned_commit_sha = verdict_block.get("scanned_commit_sha") if isinstance(verdict_block, dict) else None
+                eng_acknowledged_cwes = verdict_block.get("acknowledged_cwes", []) if isinstance(verdict_block, dict) else []
 
                 # overall_status: 엔진 verdict 우선, fallback은 기존 로직
                 if eng_verdict:
@@ -582,12 +584,14 @@ async def _save_parsed_data_to_db(job_id: str, obj: dict) -> None:
                         (summary_id, job_id, total_findings, critical_count, high_count, medium_count, low_count,
                          gitleaks_count, semgrep_count, overall_status, status_reason,
                          verdict, score, score_label, gauge_color, selected_items, selected_count,
-                         out_of_scope_count, requires_approval, block_reasons, warn_reasons, score_breakdown)
+                         out_of_scope_count, requires_approval, block_reasons, warn_reasons, score_breakdown,
+                         scanned_commit_sha, acknowledged_cwes)
                     VALUES
                         (gen_random_uuid(), :job_id, :total, :critical, :high, :medium, :low,
                          :gitleaks, :semgrep, :overall, :reason,
                          :verdict, :score, :score_label, :gauge_color, :selected_items::jsonb, :selected_count,
-                         :out_of_scope, :requires_approval, :block_reasons::jsonb, :warn_reasons::jsonb, :score_breakdown::jsonb)
+                         :out_of_scope, :requires_approval, :block_reasons::jsonb, :warn_reasons::jsonb, :score_breakdown::jsonb,
+                         :scanned_commit_sha, :acknowledged_cwes::jsonb)
                     ON CONFLICT (job_id) DO UPDATE SET
                         total_findings = :total, critical_count = :critical, high_count = :high,
                         medium_count = :medium, low_count = :low, gitleaks_count = :gitleaks,
@@ -597,6 +601,7 @@ async def _save_parsed_data_to_db(job_id: str, obj: dict) -> None:
                         selected_count = :selected_count, out_of_scope_count = :out_of_scope,
                         requires_approval = :requires_approval, block_reasons = :block_reasons::jsonb,
                         warn_reasons = :warn_reasons::jsonb, score_breakdown = :score_breakdown::jsonb,
+                        scanned_commit_sha = :scanned_commit_sha, acknowledged_cwes = :acknowledged_cwes::jsonb,
                         calculated_at = CURRENT_TIMESTAMP
                 """), {
                     "job_id": job_id,
@@ -620,6 +625,8 @@ async def _save_parsed_data_to_db(job_id: str, obj: dict) -> None:
                     "block_reasons": _json.dumps(eng_block_reasons),
                     "warn_reasons": _json.dumps(eng_warn_reasons),
                     "score_breakdown": _json.dumps(eng_score_breakdown),
+                    "scanned_commit_sha": eng_scanned_commit_sha,
+                    "acknowledged_cwes": _json.dumps(eng_acknowledged_cwes),
                 })
 
             # ── 5) deployments: deploy step에서 배포 정보 추출 ──
@@ -962,17 +969,54 @@ async def approve_job(
         if not rec:
             raise HTTPException(status_code=404, detail="승인 대기 레코드 없음")
 
+        # 원본 잡 조회
+        orig_job = await session.get(PipelineJob, job_id)
+        if not orig_job:
+            raise HTTPException(status_code=404, detail="원본 job not found")
+
+        # approved_cwes: block_reasons에서 CWE 추출 (CWE-xxx 패턴)
+        import re as _re
+        approved_cwes = list({
+            m.group(0)
+            for r in (rec.block_reasons or [])
+            for m in [_re.search(r"CWE-\d+", r)]
+            if m
+        })
+
         now = datetime.now(timezone.utc)
         rec.status = "approved"
         rec.reason = reason
         rec.approver_id = str(current_user.get("github_login") or current_user.get("id", "unknown"))
         rec.approved_at = now
         rec.expires_at = body.get("expires_at") and _parse_time_safe(body["expires_at"])
+
+        # 후속 잡 enqueue: 같은 repo+branch+commit_sha, approved_cwes 포함
+        followup_id = str(uuid4())
+        followup_job = PipelineJob(
+            job_id=followup_id,
+            repo_url=orig_job.repo_url,
+            branch=orig_job.branch,
+            trigger_source="approval",
+            status="queued",
+            source=orig_job.source,
+            environment=orig_job.environment,
+            workflow_path=orig_job.workflow_path,
+            selected_items=orig_job.selected_items or [],
+            commit_sha=orig_job.commit_sha,
+            approved_cwes=approved_cwes,
+            approval_record_id=rec.id,
+            created_at=now,
+        )
+        session.add(followup_job)
+        rec.followup_job_id = followup_id
+
         await session.commit()
         await session.refresh(rec)
 
-        print(f"[approval] APPROVED job={job_id} by={rec.approver_id} reason={reason}")
-        return _approval_to_dict(rec)
+        print(f"[approval] APPROVED job={job_id} by={rec.approver_id} reason={reason} → followup={followup_id} approved_cwes={approved_cwes}")
+        result = _approval_to_dict(rec)
+        result["followup_job_id"] = followup_id
+        return result
 
 
 @app.post("/api/jobs/{job_id}/approval/reject")
@@ -1024,10 +1068,13 @@ def _approval_to_dict(rec: ApprovalRecord) -> dict:
         "id": rec.id,
         "job_id": rec.job_id,
         "commit_sha": rec.commit_sha,
+        "scanned_commit_sha": rec.scanned_commit_sha,
         "repo": rec.repo,
         "branch": rec.branch,
         "target_cwes": rec.target_cwes,
         "block_reasons": rec.block_reasons,
+        "acknowledged_cwes": rec.acknowledged_cwes or [],
+        "followup_job_id": rec.followup_job_id,
         "reason": rec.reason,
         "approver_id": rec.approver_id,
         "status": rec.status,
@@ -1060,6 +1107,7 @@ def _job_to_engine_dict(job: PipelineJob) -> dict:
         "workflow_path": job.workflow_path,
         "selected_items": job.selected_items or [],
         "commit_sha": job.commit_sha,
+        "approved_cwes": job.approved_cwes or [],
         "created_at": job.created_at.isoformat() if job.created_at else None,
     }
 
