@@ -76,6 +76,8 @@ class PipelineJob(Base):
     workflow_path: Mapped[str | None] = mapped_column(String(2048))
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     claimed_by: Mapped[str | None] = mapped_column(String(255))
+    selected_items: Mapped[list | None] = mapped_column(JSONB, default=list)
+    commit_sha: Mapped[str | None] = mapped_column(String(64))
 
 
 class PipelineStep(Base):
@@ -130,6 +132,8 @@ class SecurityFinding(Base):
     cvss_score: Mapped[float | None] = mapped_column(Float)
     is_masked: Mapped[bool] = mapped_column(Boolean, default=False)
     ai_fix_suggestion: Mapped[str | None] = mapped_column(Text)
+    policy_item: Mapped[str | None] = mapped_column(String(100))
+    in_scope: Mapped[bool] = mapped_column(Boolean, default=True)
     metadata_: Mapped[dict | None] = mapped_column("metadata", JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.current_timestamp())
 
@@ -186,4 +190,40 @@ class SecuritySummary(Base):
     semgrep_count: Mapped[int] = mapped_column(Integer, default=0)
     overall_status: Mapped[str] = mapped_column(String(20), default="passed")
     status_reason: Mapped[str | None] = mapped_column(Text)
+    # 엔진 verdict 스냅샷 (새 스키마)
+    verdict: Mapped[str | None] = mapped_column(String(50))
+    score: Mapped[float | None] = mapped_column(Float)
+    score_label: Mapped[str | None] = mapped_column(String(200))
+    gauge_color: Mapped[str | None] = mapped_column(String(20))
+    selected_items: Mapped[list | None] = mapped_column(JSONB, default=list)
+    selected_count: Mapped[int | None] = mapped_column(Integer)
+    out_of_scope_count: Mapped[int | None] = mapped_column(Integer, default=0)
+    requires_approval: Mapped[bool] = mapped_column(Boolean, default=False)
+    block_reasons: Mapped[list | None] = mapped_column(JSONB, default=list)
+    warn_reasons: Mapped[list | None] = mapped_column(JSONB, default=list)
+    score_breakdown: Mapped[dict | None] = mapped_column(JSONB, default=dict)
     calculated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.current_timestamp())
+
+
+ApprovalStatus = Enum('pending', 'approved', 'rejected', name='approval_status', create_type=False)
+
+
+class ApprovalRecord(Base):
+    """approval_records 테이블 — High 승인 예외 워크플로."""
+    __tablename__ = "approval_records"
+    __table_args__ = {"extend_existing": True}
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=lambda: str(uuid4()))
+    job_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey("pipeline_jobs.job_id", ondelete="CASCADE"), nullable=False)
+    commit_sha: Mapped[str | None] = mapped_column(String(64))
+    repo: Mapped[str] = mapped_column(String(2048), nullable=False)
+    branch: Mapped[str] = mapped_column(String(255), nullable=False)
+    target_cwes: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    block_reasons: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    verdict_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    reason: Mapped[str | None] = mapped_column(Text)
+    approver_id: Mapped[str | None] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(ApprovalStatus, nullable=False, default="pending")
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.current_timestamp())

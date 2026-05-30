@@ -13,6 +13,10 @@ class StartPipelineRequest(BaseModel):
         default_factory=list,
         description="실행할 검사 항목 (예: ['build','lightweight-security','deep-security','deploy']). 비어 있으면 전체 실행.",
     )
+    selected_items: list[str] = Field(
+        default_factory=list,
+        description="보안 정책 검사 항목 (예: ['CWE-89','sql-injection']). 비어 있으면 16개 전체 검사.",
+    )
     is_first_run: bool = Field(
         default=False,
         description="최초 실행 여부 플래그 (엔진에 IS_FIRST_RUN 환경변수로 전달).",
@@ -20,6 +24,7 @@ class StartPipelineRequest(BaseModel):
     source: str = Field(default="capstone", description="엔진 소스 식별자 (capstone | mirae)")
     environment: str = Field(default="development", description="실행 환경 (production | staging | development | feature)")
     workflow_path: str | None = Field(default=None, description="커스텀 워크플로우 파일 경로")
+    commit_sha: str | None = Field(default=None, description="트리거된 커밋 SHA")
 
 
 class SecurityPayload(BaseModel):
@@ -31,7 +36,7 @@ class SecurityPayload(BaseModel):
 
 class StartPipelineResponse(BaseModel):
     job_id: str
-    status: Literal["queued", "triggered"]
+    status: Literal["queued", "triggered", "pending"]
     message: str
 
 

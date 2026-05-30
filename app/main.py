@@ -14,6 +14,7 @@ from app.auth.jwt_utils import get_current_user
 from app.auth.router import router as auth_router
 from app.db import Base, SessionLocal, engine
 from app.db_models import (  # noqa: F401
+    ApprovalRecord,
     BuildArtifact,
     Deployment,
     PipelineJob,
@@ -121,6 +122,8 @@ async def start_pipeline(req: StartPipelineRequest) -> StartPipelineResponse:
                 source=req.source,
                 environment=req.environment,
                 workflow_path=req.workflow_path,
+                selected_items=req.selected_items or [],
+                commit_sha=req.commit_sha,
                 created_at=now,
             )
             session.add(job)
@@ -412,6 +415,9 @@ async def _save_parsed_data_to_db(job_id: str, obj: dict) -> None:
                         is_masked=scan_type == "gitleaks",
                         ai_fix_suggestion=ai_fix,
                         code_snippet=trimmed_snippet,
+                        cwe_id=f.get("cwe"),
+                        policy_item=f.get("policy_item"),
+                        in_scope=f.get("in_scope", True),
                     ))
 
             else:
@@ -533,37 +539,64 @@ async def _save_parsed_data_to_db(job_id: str, obj: dict) -> None:
                         size_bytes=a.get("size_bytes", 0),
                     ))
 
-            # ── 4) security_summary: UPSERT (트리거가 먼저 빈 row를 만들 수 있음) ──
+            # ── 4) security_summary: UPSERT — 엔진 verdict 스냅샷 우선 사용 ──
             if total_findings > 0 or step_map.get("lightweight-security") or step_map.get("deep-security"):
-                overall = "passed"
-                reason_parts = []
-                if sev_counts["critical"] > 0:
-                    overall = "failed"
-                    reason_parts.append(f"critical={sev_counts['critical']}")
-                if sev_counts["high"] > 0:
-                    overall = "failed"
-                    reason_parts.append(f"high={sev_counts['high']}")
-                if sev_counts["medium"] > 0:
-                    if overall == "passed":
-                        overall = "warning"
-                    reason_parts.append(f"medium={sev_counts['medium']}")
-                if sev_counts["low"] > 0:
-                    reason_parts.append(f"low={sev_counts['low']}")
-                if not reason_parts:
-                    reason_parts.append("no findings")
+                # 엔진 verdict 블록 (새 스키마)
+                verdict_block = security_block.get("verdict", {})
+                eng_verdict = verdict_block.get("verdict") if isinstance(verdict_block, dict) else None
+                eng_score = verdict_block.get("score") if isinstance(verdict_block, dict) else None
+                eng_score_label = verdict_block.get("score_label") if isinstance(verdict_block, dict) else None
+                eng_gauge_color = verdict_block.get("gauge_color") if isinstance(verdict_block, dict) else None
+                eng_selected_items = verdict_block.get("selected_items", []) if isinstance(verdict_block, dict) else []
+                eng_selected_count = verdict_block.get("selected_count") if isinstance(verdict_block, dict) else None
+                eng_out_of_scope = verdict_block.get("out_of_scope_count", 0) if isinstance(verdict_block, dict) else 0
+                eng_requires_approval = verdict_block.get("requires_approval", False) if isinstance(verdict_block, dict) else False
+                eng_block_reasons = verdict_block.get("block_reasons", []) if isinstance(verdict_block, dict) else []
+                eng_warn_reasons = verdict_block.get("warn_reasons", []) if isinstance(verdict_block, dict) else []
+                eng_score_breakdown = verdict_block.get("score_breakdown", {}) if isinstance(verdict_block, dict) else {}
 
+                # overall_status: 엔진 verdict 우선, fallback은 기존 로직
+                if eng_verdict:
+                    overall = eng_verdict
+                    status_reason = "; ".join(eng_block_reasons + eng_warn_reasons) if (eng_block_reasons or eng_warn_reasons) else eng_verdict
+                else:
+                    overall = "passed"
+                    reason_parts = []
+                    if sev_counts["critical"] > 0:
+                        overall = "block"
+                        reason_parts.append(f"critical={sev_counts['critical']}")
+                    elif sev_counts["high"] > 0:
+                        overall = "block_pending_approval"
+                        reason_parts.append(f"high={sev_counts['high']}")
+                    elif sev_counts["medium"] > 0:
+                        overall = "warn"
+                        reason_parts.append(f"medium={sev_counts['medium']}")
+                    if sev_counts["low"] > 0:
+                        reason_parts.append(f"low={sev_counts['low']}")
+                    status_reason = "; ".join(reason_parts) if reason_parts else "no findings"
+
+                import json as _json
                 from sqlalchemy import text as sa_text
                 await session.execute(sa_text("""
                     INSERT INTO security_summary
                         (summary_id, job_id, total_findings, critical_count, high_count, medium_count, low_count,
-                         gitleaks_count, semgrep_count, overall_status, status_reason)
+                         gitleaks_count, semgrep_count, overall_status, status_reason,
+                         verdict, score, score_label, gauge_color, selected_items, selected_count,
+                         out_of_scope_count, requires_approval, block_reasons, warn_reasons, score_breakdown)
                     VALUES
                         (gen_random_uuid(), :job_id, :total, :critical, :high, :medium, :low,
-                         :gitleaks, :semgrep, :overall, :reason)
+                         :gitleaks, :semgrep, :overall, :reason,
+                         :verdict, :score, :score_label, :gauge_color, :selected_items::jsonb, :selected_count,
+                         :out_of_scope, :requires_approval, :block_reasons::jsonb, :warn_reasons::jsonb, :score_breakdown::jsonb)
                     ON CONFLICT (job_id) DO UPDATE SET
                         total_findings = :total, critical_count = :critical, high_count = :high,
                         medium_count = :medium, low_count = :low, gitleaks_count = :gitleaks,
                         semgrep_count = :semgrep, overall_status = :overall, status_reason = :reason,
+                        verdict = :verdict, score = :score, score_label = :score_label,
+                        gauge_color = :gauge_color, selected_items = :selected_items::jsonb,
+                        selected_count = :selected_count, out_of_scope_count = :out_of_scope,
+                        requires_approval = :requires_approval, block_reasons = :block_reasons::jsonb,
+                        warn_reasons = :warn_reasons::jsonb, score_breakdown = :score_breakdown::jsonb,
                         calculated_at = CURRENT_TIMESTAMP
                 """), {
                     "job_id": job_id,
@@ -575,7 +608,18 @@ async def _save_parsed_data_to_db(job_id: str, obj: dict) -> None:
                     "gitleaks": gitleaks_count,
                     "semgrep": semgrep_count,
                     "overall": overall,
-                    "reason": "; ".join(reason_parts),
+                    "reason": status_reason,
+                    "verdict": eng_verdict or overall,
+                    "score": eng_score,
+                    "score_label": eng_score_label,
+                    "gauge_color": eng_gauge_color,
+                    "selected_items": _json.dumps(eng_selected_items),
+                    "selected_count": eng_selected_count,
+                    "out_of_scope": eng_out_of_scope,
+                    "requires_approval": eng_requires_approval,
+                    "block_reasons": _json.dumps(eng_block_reasons),
+                    "warn_reasons": _json.dumps(eng_warn_reasons),
+                    "score_breakdown": _json.dumps(eng_score_breakdown),
                 })
 
             # ── 5) deployments: deploy step에서 배포 정보 추출 ──
@@ -800,6 +844,199 @@ def _guess_artifact_type(name: str) -> str:
     return "other"
 
 
+# ── 보안 정책 카탈로그 (16개 항목) ───────────────────────────────────────────
+
+SECURITY_CATALOG = [
+    {"key": "sql-injection",           "name": "SQL Injection",                  "cwe": "CWE-89",   "grade": "critical"},
+    {"key": "command-injection",       "name": "Command Injection",              "cwe": "CWE-78",   "grade": "critical"},
+    {"key": "hardcoded-secret",        "name": "Hardcoded Secret",               "cwe": "CWE-798",  "grade": "critical"},
+    {"key": "code-injection",          "name": "Code Injection",                 "cwe": "CWE-94",   "grade": "critical"},
+    {"key": "insecure-deserialization","name": "Insecure Deserialization",        "cwe": "CWE-502",  "grade": "high"},
+    {"key": "idor",                    "name": "IDOR",                           "cwe": "CWE-639",  "grade": "high"},
+    {"key": "improper-jwt",            "name": "Improper JWT Verification",       "cwe": "CWE-347",  "grade": "high"},
+    {"key": "cleartext-transmission",  "name": "Cleartext Transmission",         "cwe": "CWE-319",  "grade": "high"},
+    {"key": "path-traversal",          "name": "Path Traversal",                 "cwe": "CWE-22",   "grade": "medium"},
+    {"key": "xss",                     "name": "Cross-Site Scripting (XSS)",     "cwe": "CWE-79",   "grade": "medium"},
+    {"key": "weak-crypto",             "name": "Weak Cryptography",              "cwe": "CWE-327",  "grade": "medium"},
+    {"key": "ssrf",                    "name": "SSRF",                           "cwe": "CWE-918",  "grade": "medium"},
+    {"key": "error-info-exposure",     "name": "Error Message Info Exposure",    "cwe": "CWE-209",  "grade": "low"},
+    {"key": "missing-httponly",        "name": "Missing HttpOnly Flag",          "cwe": "CWE-1004", "grade": "low"},
+    {"key": "missing-secure-flag",     "name": "Missing Secure Flag",            "cwe": "CWE-614",  "grade": "low"},
+    {"key": "weak-password-policy",    "name": "Weak Password Requirements",     "cwe": "CWE-521",  "grade": "low"},
+]
+
+_CATALOG_BY_KEY = {item["key"]: item for item in SECURITY_CATALOG}
+_CATALOG_BY_CWE = {item["cwe"]: item for item in SECURITY_CATALOG}
+
+
+@app.get("/api/security/catalog")
+def get_security_catalog() -> dict:
+    """보안 정책 16개 항목 카탈로그."""
+    by_grade: dict[str, list] = {"critical": [], "high": [], "medium": [], "low": []}
+    for item in SECURITY_CATALOG:
+        by_grade[item["grade"]].append(item)
+    return {"total": len(SECURITY_CATALOG), "items": SECURITY_CATALOG, "by_grade": by_grade}
+
+
+# ── 승인 워크플로 API ─────────────────────────────────────────────────────────
+
+@app.get("/api/jobs/{job_id}/approval")
+async def get_approval(job_id: str, current_user: dict = Depends(get_current_user)) -> dict:
+    """해당 job의 승인 레코드 조회."""
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(ApprovalRecord).where(ApprovalRecord.job_id == job_id).order_by(ApprovalRecord.created_at.desc()).limit(1)
+        )
+        rec = result.scalar()
+        if not rec:
+            raise HTTPException(status_code=404, detail="승인 레코드 없음")
+        return _approval_to_dict(rec)
+
+
+@app.post("/api/jobs/{job_id}/approval/request")
+async def request_approval(job_id: str, current_user: dict = Depends(get_current_user)) -> dict:
+    """block_pending_approval 상태인 job에 대해 승인 레코드 생성."""
+    async with SessionLocal() as session:
+        job = await session.get(PipelineJob, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="job not found")
+
+        summary_result = await session.execute(
+            select(SecuritySummary).where(SecuritySummary.job_id == job_id)
+        )
+        summary = summary_result.scalar()
+        if not summary or summary.verdict != "block_pending_approval":
+            raise HTTPException(status_code=409, detail="이 job은 block_pending_approval 상태가 아닙니다")
+
+        existing = await session.execute(
+            select(ApprovalRecord).where(
+                ApprovalRecord.job_id == job_id,
+                ApprovalRecord.status == "pending",
+            )
+        )
+        if existing.scalar():
+            raise HTTPException(status_code=409, detail="이미 승인 대기 중인 레코드가 있습니다")
+
+        rec = ApprovalRecord(
+            job_id=job_id,
+            commit_sha=job.commit_sha,
+            repo=job.repo_url,
+            branch=job.branch,
+            target_cwes=[r.split("(")[1].split(",")[0].strip() if "(" in r else "" for r in (summary.block_reasons or [])],
+            block_reasons=summary.block_reasons or [],
+            verdict_snapshot=summary.verdict_snapshot if hasattr(summary, "verdict_snapshot") else {},
+            status="pending",
+        )
+        session.add(rec)
+        await session.commit()
+        await session.refresh(rec)
+        return _approval_to_dict(rec)
+
+
+@app.post("/api/jobs/{job_id}/approval/approve")
+async def approve_job(
+    job_id: str,
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """승인: reason 필수. block은 승인 불가."""
+    reason = (body.get("reason") or "").strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="승인 사유(reason)를 입력하세요")
+
+    async with SessionLocal() as session:
+        summary_result = await session.execute(
+            select(SecuritySummary).where(SecuritySummary.job_id == job_id)
+        )
+        summary = summary_result.scalar()
+        if summary and summary.verdict == "block":
+            raise HTTPException(status_code=403, detail="Critical 차단(block)은 승인 경로가 없습니다")
+
+        result = await session.execute(
+            select(ApprovalRecord).where(
+                ApprovalRecord.job_id == job_id,
+                ApprovalRecord.status == "pending",
+            ).order_by(ApprovalRecord.created_at.desc()).limit(1)
+        )
+        rec = result.scalar()
+        if not rec:
+            raise HTTPException(status_code=404, detail="승인 대기 레코드 없음")
+
+        now = datetime.now(timezone.utc)
+        rec.status = "approved"
+        rec.reason = reason
+        rec.approver_id = str(current_user.get("github_login") or current_user.get("id", "unknown"))
+        rec.approved_at = now
+        rec.expires_at = body.get("expires_at") and _parse_time_safe(body["expires_at"])
+        await session.commit()
+        await session.refresh(rec)
+
+        print(f"[approval] APPROVED job={job_id} by={rec.approver_id} reason={reason}")
+        return _approval_to_dict(rec)
+
+
+@app.post("/api/jobs/{job_id}/approval/reject")
+async def reject_job(
+    job_id: str,
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """거부."""
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(ApprovalRecord).where(
+                ApprovalRecord.job_id == job_id,
+                ApprovalRecord.status == "pending",
+            ).order_by(ApprovalRecord.created_at.desc()).limit(1)
+        )
+        rec = result.scalar()
+        if not rec:
+            raise HTTPException(status_code=404, detail="승인 대기 레코드 없음")
+
+        rec.status = "rejected"
+        rec.reason = (body.get("reason") or "").strip() or None
+        rec.approver_id = str(current_user.get("github_login") or current_user.get("id", "unknown"))
+        rec.approved_at = datetime.now(timezone.utc)
+        await session.commit()
+        await session.refresh(rec)
+
+        print(f"[approval] REJECTED job={job_id} by={rec.approver_id}")
+        return _approval_to_dict(rec)
+
+
+@app.get("/api/approvals")
+async def list_approvals(
+    status: str | None = Query(None, description="pending|approved|rejected"),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """승인 레코드 목록 (감사 로그용)."""
+    async with SessionLocal() as session:
+        q = select(ApprovalRecord).order_by(ApprovalRecord.created_at.desc())
+        if status:
+            q = q.where(ApprovalRecord.status == status)
+        result = await session.execute(q.limit(100))
+        records = result.scalars().all()
+        return {"total": len(records), "records": [_approval_to_dict(r) for r in records]}
+
+
+def _approval_to_dict(rec: ApprovalRecord) -> dict:
+    return {
+        "id": rec.id,
+        "job_id": rec.job_id,
+        "commit_sha": rec.commit_sha,
+        "repo": rec.repo,
+        "branch": rec.branch,
+        "target_cwes": rec.target_cwes,
+        "block_reasons": rec.block_reasons,
+        "reason": rec.reason,
+        "approver_id": rec.approver_id,
+        "status": rec.status,
+        "approved_at": rec.approved_at.isoformat() if rec.approved_at else None,
+        "expires_at": rec.expires_at.isoformat() if rec.expires_at else None,
+        "created_at": rec.created_at.isoformat() if rec.created_at else None,
+    }
+
+
 # ── 엔진 polling API ──────────────────────────────────────────────────────────
 
 def _verify_engine_token(request: Request) -> None:
@@ -821,6 +1058,8 @@ def _job_to_engine_dict(job: PipelineJob) -> dict:
         "source": job.source,
         "environment": job.environment,
         "workflow_path": job.workflow_path,
+        "selected_items": job.selected_items or [],
+        "commit_sha": job.commit_sha,
         "created_at": job.created_at.isoformat() if job.created_at else None,
     }
 
@@ -1072,6 +1311,8 @@ async def create_pipeline(
                 source=req.source,
                 environment=req.environment,
                 workflow_path=req.workflow_path,
+                selected_items=req.selected_items or [],
+                commit_sha=req.commit_sha,
                 created_at=now,
             )
             session.add(job)
@@ -1313,7 +1554,6 @@ async def get_job_result(
 
             findings_list = []
             for f in findings:
-                # code_snippet_start_line 계산
                 snippet_start = None
                 if f.code_snippet and f.line_number:
                     snippet_line_count = f.code_snippet.count("\n") + 1
@@ -1324,6 +1564,9 @@ async def get_job_result(
                     "id": f.finding_id,
                     "scanner": f.scan_type,
                     "rule_id": f.rule_id,
+                    "cwe": f.cwe_id,
+                    "policy_item": f.policy_item,
+                    "in_scope": f.in_scope,
                     "cve": None,
                     "cvss": str(f.cvss_score) if f.cvss_score else None,
                     "cvss_version": None,
@@ -1339,19 +1582,39 @@ async def get_job_result(
                     "references": [],
                 })
 
+            # approval 레코드 조회
+            approval_result = await session.execute(
+                select(ApprovalRecord)
+                .where(ApprovalRecord.job_id == job_id)
+                .order_by(ApprovalRecord.created_at.desc())
+                .limit(1)
+            )
+            approval = approval_result.scalar()
+
             return {
                 "job_id": job_id,
                 "repo_url": job.repo_url,
                 "branch": job.branch,
+                "commit_sha": job.commit_sha,
                 "completed_at": job.completed_at.isoformat() if job.completed_at else None,
                 "scores": {
-                    "security_score": sec_score,
+                    "security_score": summary.score if (summary and summary.score is not None) else sec_score,
+                    "score_label": summary.score_label if summary else None,
+                    "gauge_color": summary.gauge_color if summary else "green",
                     "code_quality_score": 100,
                 },
                 "verdict": {
+                    "verdict": summary.verdict if summary else "pass",
                     "overall_status": summary.overall_status if summary else "passed",
                     "status_reason": summary.status_reason if summary else "no findings",
                     "total_findings": summary.total_findings if summary else 0,
+                    "requires_approval": summary.requires_approval if summary else False,
+                    "block_reasons": summary.block_reasons if summary else [],
+                    "warn_reasons": summary.warn_reasons if summary else [],
+                    "selected_items": summary.selected_items if summary else [],
+                    "selected_count": summary.selected_count if summary else 0,
+                    "out_of_scope_count": summary.out_of_scope_count if summary else 0,
+                    "score_breakdown": summary.score_breakdown if summary else {},
                 },
                 "severity_summary": {
                     "critical": summary.critical_count if summary else 0,
@@ -1361,6 +1624,7 @@ async def get_job_result(
                 },
                 "scanner_summaries": list(scanner_map.values()),
                 "findings": findings_list,
+                "approval": _approval_to_dict(approval) if approval else None,
                 "pagination": {
                     "total": total,
                     "limit": limit,
