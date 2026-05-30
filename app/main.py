@@ -55,10 +55,25 @@ app = FastAPI(
     root_path=os.getenv("ROOT_PATH", ""),
 )
 
+# Cloudflare / 리버스프록시 X-Forwarded-* 헤더 신뢰
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+
+def _get_allowed_origins() -> list[str]:
+    """ALLOWED_ORIGINS 환경변수(콤마구분) + 기본 허용 목록."""
+    base = [
+        "https://api.pwd.kr",
+        "https://pwd.kr",
+    ]
+    extra = os.getenv("ALLOWED_ORIGINS", "")
+    if extra:
+        base += [o.strip() for o in extra.split(",") if o.strip()]
+    return base
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=_get_allowed_origins(),
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )

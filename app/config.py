@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     token_encryption_key: str = Field(default="", alias="TOKEN_ENCRYPTION_KEY")
     frontend_origin: str = Field(default="", alias="FRONTEND_ORIGIN")
     engine_shared_token: str = Field(default="", alias="ENGINE_SHARED_TOKEN")
+    trusted_proxies: str = Field(default="cloudflare", alias="TRUSTED_PROXIES")
+    allowed_origins: str = Field(default="", alias="ALLOWED_ORIGINS")
 
 
 @lru_cache
