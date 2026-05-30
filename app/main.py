@@ -946,7 +946,10 @@ async def approve_job(
     body: dict,
     current_user: dict = Depends(get_current_user),
 ) -> dict:
-    """승인: reason 필수. block은 승인 불가."""
+    """승인: reason 필수. block은 승인 불가.
+    body: {"reason": "...", "approved_cwes": ["CWE-639"]}
+    approved_cwes 미지정 시 block_reasons의 모든 CWE 수용(전체 승인).
+    부분 승인: approved_cwes에 수용할 CWE만 명시. Critical CWE는 자동 제외."""
     reason = (body.get("reason") or "").strip()
     if not reason:
         raise HTTPException(status_code=400, detail="승인 사유(reason)를 입력하세요")
@@ -974,14 +977,23 @@ async def approve_job(
         if not orig_job:
             raise HTTPException(status_code=404, detail="원본 job not found")
 
-        # approved_cwes: block_reasons에서 CWE 추출 (CWE-xxx 패턴)
+        # approved_cwes: body에 명시된 CWE 우선, 없으면 block_reasons 전체 추출
         import re as _re
-        approved_cwes = list({
-            m.group(0)
-            for r in (rec.block_reasons or [])
-            for m in [_re.search(r"CWE-\d+", r)]
-            if m
-        })
+        if body.get("approved_cwes"):
+            # 명시적 부분 승인: Critical은 제외
+            critical_cwes = {"CWE-89", "CWE-78", "CWE-798", "CWE-94"}
+            approved_cwes = [
+                c for c in body["approved_cwes"]
+                if c not in critical_cwes
+            ]
+        else:
+            # 미명시 시 block_reasons의 모든 CWE 수용 (전체 승인)
+            approved_cwes = list({
+                m.group(0)
+                for r in (rec.block_reasons or [])
+                for m in [_re.search(r"CWE-\d+", r)]
+                if m
+            })
 
         now = datetime.now(timezone.utc)
         rec.status = "approved"

@@ -558,7 +558,10 @@ verdict = "block"
    → approval_records INSERT (status = pending)
 
 4. 보안 책임자가 POST /api/jobs/{id}/approval/approve
-   Body: {"reason": "내부 검토 후 수용 결정 — 차기 스프린트 패치 예정"}
+   Body (전체 승인):  {"reason": "내부 검토 후 수용 결정 — 차기 스프린트 패치 예정"}
+   Body (부분 승인):  {"reason": "IDOR만 수용, JWT는 이번 스프린트 내 패치", "approved_cwes": ["CWE-639"]}
+   → 미명시 시 block_reasons의 모든 CWE 수용
+   → Critical CWE는 approved_cwes에 넣어도 자동 제외
    → approval_records UPDATE (status = approved)
    → 백엔드가 approved_cwes 포함 후속 잡 자동 enqueue
    Response: {"followup_job_id": "f1a2b3c4-..."}
