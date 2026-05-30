@@ -573,20 +573,24 @@ async def _save_parsed_data_to_db(job_id: str, obj: dict) -> None:
                 eng_acknowledged_cwes = verdict_block.get("acknowledged_cwes", []) if isinstance(verdict_block, dict) else []
 
                 # overall_status: 엔진 verdict 우선, fallback은 기존 로직
+                _VERDICT_TO_STATUS = {
+                    "pass": "passed", "block": "failed", "warn": "warning",
+                    "block_pending_approval": "warning",
+                }
                 if eng_verdict:
-                    overall = eng_verdict
+                    overall = _VERDICT_TO_STATUS.get(eng_verdict, eng_verdict)
                     status_reason = "; ".join(eng_block_reasons + eng_warn_reasons) if (eng_block_reasons or eng_warn_reasons) else eng_verdict
                 else:
                     overall = "passed"
                     reason_parts = []
                     if sev_counts["critical"] > 0:
-                        overall = "block"
+                        overall = "failed"
                         reason_parts.append(f"critical={sev_counts['critical']}")
                     elif sev_counts["high"] > 0:
-                        overall = "block_pending_approval"
+                        overall = "warning"
                         reason_parts.append(f"high={sev_counts['high']}")
                     elif sev_counts["medium"] > 0:
-                        overall = "warn"
+                        overall = "warning"
                         reason_parts.append(f"medium={sev_counts['medium']}")
                     if sev_counts["low"] > 0:
                         reason_parts.append(f"low={sev_counts['low']}")
