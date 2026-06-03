@@ -78,6 +78,7 @@ class PipelineJob(Base):
     claimed_by: Mapped[str | None] = mapped_column(String(255))
     selected_items: Mapped[list | None] = mapped_column(JSONB, default=list)
     commit_sha: Mapped[str | None] = mapped_column(String(64))
+    user_id: Mapped[int | None] = mapped_column(BigInteger)
     approved_cwes: Mapped[list | None] = mapped_column(JSONB, default=list)
     approval_record_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False))
 

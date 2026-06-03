@@ -122,7 +122,10 @@ def health() -> dict[str, str]:
 
 
 @app.post("/start-pipeline", response_model=StartPipelineResponse)
-async def start_pipeline(req: StartPipelineRequest) -> StartPipelineResponse:
+async def start_pipeline(
+    req: StartPipelineRequest,
+    current_user: User = Depends(get_current_user),
+) -> StartPipelineResponse:
     job_id = str(uuid4())
     now = datetime.now(timezone.utc)
 
@@ -140,6 +143,7 @@ async def start_pipeline(req: StartPipelineRequest) -> StartPipelineResponse:
                 selected_items=req.selected_items or [],
                 commit_sha=req.commit_sha,
                 created_at=now,
+                user_id=current_user.id,
             )
             session.add(job)
             await session.commit()
@@ -1128,7 +1132,27 @@ def _verify_engine_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Invalid engine token")
 
 
-def _job_to_engine_dict(job: PipelineJob) -> dict:
+async def _job_to_engine_dict(job: PipelineJob, session) -> dict:
+    from app.auth.crypto import decrypt_token
+    from app.auth.token_store import get_token
+
+    repo_token = None
+    if job.user_id:
+        # 메모리 캐시 우선
+        user_result = await session.execute(
+            select(User).where(User.id == job.user_id)
+        )
+        user = user_result.scalar_one_or_none()
+        if user:
+            cached = get_token(user.github_id)
+            if cached:
+                repo_token = cached
+            elif user.github_access_token_encrypted:
+                try:
+                    repo_token = decrypt_token(user.github_access_token_encrypted)
+                except Exception:
+                    repo_token = None
+
     return {
         "job_id": job.job_id,
         "repo_url": job.repo_url,
@@ -1140,6 +1164,7 @@ def _job_to_engine_dict(job: PipelineJob) -> dict:
         "commit_sha": job.commit_sha,
         "approved_cwes": job.approved_cwes or [],
         "created_at": job.created_at.isoformat() if job.created_at else None,
+        "repo_token": repo_token,
     }
 
 
@@ -1159,7 +1184,7 @@ async def get_pending_jobs(
                 .limit(limit)
             )
             jobs = result.scalars().all()
-            return {"jobs": [_job_to_engine_dict(j) for j in jobs]}
+            return {"jobs": [await _job_to_engine_dict(j, session) for j in jobs]}
     except HTTPException:
         raise
     except Exception as exc:
@@ -1189,7 +1214,7 @@ async def claim_job(job_id: str, request: Request) -> dict:
             await session.commit()
             await session.refresh(job)
             print(f"[engine] job claimed: {job_id} by {engine_id}")
-            return _job_to_engine_dict(job)
+            return await _job_to_engine_dict(job, session)
     except HTTPException:
         raise
     except Exception as exc:
