@@ -1646,21 +1646,38 @@ async def get_job_result(
             )
             findings = findings_result.scalars().all()
 
-            # scanner별 집계
-            scanner_map: dict[str, dict] = {}
-            for f in findings:
-                sc = f.scan_type
-                if sc not in scanner_map:
-                    scanner_map[sc] = {"scanner": sc, "count": 0, "critical": 0, "high": 0, "medium": 0, "low": 0}
-                scanner_map[sc]["count"] += 1
-                scanner_map[sc][f.severity] = scanner_map[sc].get(f.severity, 0) + 1
+            # ── 전체 findings(페이지네이션 무관) 기준으로 집계 ──
+            all_findings_result = await session.execute(
+                select(SecurityFinding.scan_type, SecurityFinding.severity)
+                .where(SecurityFinding.job_id == job_id)
+            )
+            all_rows = all_findings_result.all()
 
-            # security_score: findings 없으면 100, critical/high 가중치
-            sec_score = 100
-            if summary:
-                penalty = (summary.critical_count * 20 + summary.high_count * 10 +
-                           summary.medium_count * 3 + summary.low_count * 1)
+            all_sev_counts: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+            scanner_map: dict[str, dict] = {}
+            for scan_type, sev in all_rows:
+                all_sev_counts[sev] = all_sev_counts.get(sev, 0) + 1
+                if scan_type not in scanner_map:
+                    scanner_map[scan_type] = {"scanner": scan_type, "count": 0, "critical": 0, "high": 0, "medium": 0, "low": 0}
+                scanner_map[scan_type]["count"] += 1
+                scanner_map[scan_type][sev] = scanner_map[scan_type].get(sev, 0) + 1
+
+            # severity_summary: DB summary 우선, 없으면 findings 직접 집계
+            eff_critical = summary.critical_count if summary else all_sev_counts["critical"]
+            eff_high     = summary.high_count     if summary else all_sev_counts["high"]
+            eff_medium   = summary.medium_count   if summary else all_sev_counts["medium"]
+            eff_low      = summary.low_count      if summary else all_sev_counts["low"]
+
+            # security_score: 엔진 score 우선, 없으면 findings 기준 계산
+            if summary and summary.score is not None:
+                sec_score = summary.score
+            else:
+                penalty = eff_critical * 20 + eff_high * 10 + eff_medium * 3 + eff_low * 1
                 sec_score = max(0, 100 - penalty)
+
+            # code_quality_score: critical/high findings 수에 따라 감점
+            cq_penalty = eff_critical * 15 + eff_high * 5 + eff_medium * 2 + eff_low * 1
+            code_quality_score = max(0, 100 - cq_penalty)
 
             findings_list = []
             for f in findings:
@@ -1708,10 +1725,10 @@ async def get_job_result(
                 "commit_sha": job.commit_sha,
                 "completed_at": job.completed_at.isoformat() if job.completed_at else None,
                 "scores": {
-                    "security_score": summary.score if (summary and summary.score is not None) else sec_score,
+                    "security_score": sec_score,
                     "score_label": summary.score_label if summary else None,
                     "gauge_color": summary.gauge_color if summary else "green",
-                    "code_quality_score": 100,
+                    "code_quality_score": code_quality_score,
                 },
                 "verdict": {
                     "verdict": summary.verdict if summary else "pass",
@@ -1721,16 +1738,17 @@ async def get_job_result(
                     "requires_approval": summary.requires_approval if summary else False,
                     "block_reasons": summary.block_reasons if summary else [],
                     "warn_reasons": summary.warn_reasons if summary else [],
-                    "selected_items": summary.selected_items if summary else [],
-                    "selected_count": summary.selected_count if summary else 0,
+                    # job 생성 시 프론트가 보낸 key 배열 우선, 엔진 verdict의 selected_items는 형식이 다를 수 있음
+                    "selected_items": job.selected_items or [],
+                    "selected_count": summary.selected_count if summary else len(job.selected_items or []),
                     "out_of_scope_count": summary.out_of_scope_count if summary else 0,
                     "score_breakdown": summary.score_breakdown if summary else {},
                 },
                 "severity_summary": {
-                    "critical": summary.critical_count if summary else 0,
-                    "high": summary.high_count if summary else 0,
-                    "medium": summary.medium_count if summary else 0,
-                    "low": summary.low_count if summary else 0,
+                    "critical": eff_critical,
+                    "high": eff_high,
+                    "medium": eff_medium,
+                    "low": eff_low,
                 },
                 "scanner_summaries": list(scanner_map.values()),
                 "findings": findings_list,
