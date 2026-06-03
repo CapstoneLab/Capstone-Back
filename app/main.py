@@ -82,14 +82,14 @@ app.add_middleware(
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_, exc: HTTPException) -> JSONResponse:
     """에러 응답을 프론트 명세 형식으로 통일: {error, detail, message}"""
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={
-            "error": _status_to_error_code(exc.status_code),
-            "detail": exc.detail,
-            "message": exc.detail,
-        },
-    )
+    detail = exc.detail
+    if isinstance(detail, dict):
+        # 409 등 detail이 dict인 경우: message 필드를 별도로 꺼내고 나머지는 그대로 전파
+        message = detail.get("message", str(detail))
+        content = {"error": _status_to_error_code(exc.status_code), "message": message, **detail}
+    else:
+        content = {"error": _status_to_error_code(exc.status_code), "detail": detail, "message": detail}
+    return JSONResponse(status_code=exc.status_code, content=content)
 
 
 def _status_to_error_code(code: int) -> str:
@@ -1384,10 +1384,15 @@ async def create_pipeline(
                 )
                 .limit(1)
             )
-            if conflict.first():
+            row = conflict.first()
+            if row:
+                existing_job_id = str(row[0])
                 raise HTTPException(
                     status_code=409,
-                    detail=f"{repo_url} ({req.branch}) 브랜치에 이미 실행 중인 파이프라인이 있습니다",
+                    detail={
+                        "message": f"{repo_url} ({req.branch}) 브랜치에 이미 실행 중인 파이프라인이 있습니다",
+                        "existing_job_id": existing_job_id,
+                    },
                 )
     except HTTPException:
         raise
@@ -1418,6 +1423,7 @@ async def create_pipeline(
                 selected_items=req.selected_items or [],
                 commit_sha=req.commit_sha,
                 created_at=now,
+                user_id=current_user.get("id") if isinstance(current_user, dict) else getattr(current_user, "id", None),
             )
             session.add(job)
             await session.commit()
