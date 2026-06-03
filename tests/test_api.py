@@ -10,10 +10,22 @@ class DummyTrigger:
         return
 
 
+class DummyUser:
+    id = 1
+    github_id = 12345
+    github_login = "testuser"
+
+
 def test_start_and_get_results(monkeypatch):
     from app import main
+    from app.auth import jwt_utils
 
     monkeypatch.setattr(main, "trigger_service", DummyTrigger())
+    monkeypatch.setattr(jwt_utils, "get_current_user", lambda: DummyUser())
+
+    from app.auth.jwt_utils import get_current_user
+    app.dependency_overrides[get_current_user] = lambda: DummyUser()
+
     client = TestClient(app)
 
     start = client.post(
@@ -42,3 +54,5 @@ def test_start_and_get_results(monkeypatch):
     body = get_res.json()
     assert body["found"] is True
     assert body["data"]["status"] == "success"
+
+    app.dependency_overrides.clear()
