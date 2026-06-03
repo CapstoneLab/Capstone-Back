@@ -18,12 +18,9 @@ class DummyUser:
 
 def test_start_and_get_results(monkeypatch):
     from app import main
-    from app.auth import jwt_utils
+    from app.auth.jwt_utils import get_current_user
 
     monkeypatch.setattr(main, "trigger_service", DummyTrigger())
-    monkeypatch.setattr(jwt_utils, "get_current_user", lambda: DummyUser())
-
-    from app.auth.jwt_utils import get_current_user
     app.dependency_overrides[get_current_user] = lambda: DummyUser()
 
     client = TestClient(app)
