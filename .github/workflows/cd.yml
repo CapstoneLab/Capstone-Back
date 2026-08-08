@@ -8,149 +8,101 @@ on:
 
 jobs:
   deploy:
-    name: Deploy to AWS EC2
-    runs-on: ubuntu-latest
+    name: Deploy to Ubuntu
+
+    # CI가 성공했을 때만 실행
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Deploy Docker container
+        uses: appleboy/ssh-action@v1
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          IMAGE_TAG: ${{ github.event.workflow_run.head_sha }}
+
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+          UBUNTU_SSH_HOST: ${{ secrets.UBUNTU_SSH_HOST }}
+          UBUNTU_SSH_PORT: ${{ secrets.UBUNTU_SSH_PORT }}
+          UBUNTU_SSH_USER: ${{ secrets.UBUNTU_SSH_USER }}
+          UBUNTU_SSH_PASSWORD: ${{ secrets.UBUNTU_SSH_PASSWORD }}
+          UBUNTU_RUNNER_PATH: ${{ secrets.UBUNTU_RUNNER_PATH }}
+          UBUNTU_WORKING_DIR: ${{ secrets.UBUNTU_WORKING_DIR }}
+          UBUNTU_PYTHON_COMMAND: ${{ secrets.UBUNTU_PYTHON_COMMAND }}
+
+          ENGINE_SHARED_TOKEN: ${{ secrets.ENGINE_SHARED_TOKEN }}
+          ALLOWED_ORIGINS: ${{ secrets.ALLOWED_ORIGINS }}
+
+          CALLBACK_BASE_URL: http://${{ secrets.SERVER_HOST }}:8000
+
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
 
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          envs: DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,IMAGE_TAG,OAUTH_CLIENT_ID,OAUTH_CLIENT_SECRET,JWT_SECRET,DATABASE_URL,UBUNTU_SSH_HOST,UBUNTU_SSH_PORT,UBUNTU_SSH_USER,UBUNTU_SSH_PASSWORD,UBUNTU_RUNNER_PATH,UBUNTU_WORKING_DIR,UBUNTU_PYTHON_COMMAND,ENGINE_SHARED_TOKEN,ALLOWED_ORIGINS,CALLBACK_BASE_URL
 
-      - name: Prepare artifact
-        id: artifact
-        run: |
-          DEPLOY_HASH=$(find . -type f \
-            -not -path './.git/*' \
-            -not -path './.venv/*' \
-            -not -path './__pycache__/*' \
-            -not -path './results/*' \
-            -not -path './.env' \
-            | sort | xargs sha256sum | sha256sum | cut -d' ' -f1)
-          echo "hash=${DEPLOY_HASH}" >> "$GITHUB_OUTPUT"
+          script: |
+            set -e
 
-          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          REPO=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
-          echo "owner=${OWNER}" >> "$GITHUB_OUTPUT"
-          echo "repo=${REPO}" >> "$GITHUB_OUTPUT"
-          echo "s3_key=deployments/${OWNER}/${REPO}/${DEPLOY_HASH}" >> "$GITHUB_OUTPUT"
+            IMAGE="${DOCKERHUB_USERNAME}/capstone-back:${IMAGE_TAG}"
+            CONTAINER="capstone-back"
 
-      - name: Upload artifact to S3
-        run: |
-          tar czf /tmp/deploy.tar.gz \
-            --exclude='.git' \
-            --exclude='.venv' \
-            --exclude='__pycache__' \
-            --exclude='results' \
-            --exclude='.env' \
-            .
-          aws s3 cp /tmp/deploy.tar.gz \
-            "s3://${{ secrets.S3_BUCKET }}/${{ steps.artifact.outputs.s3_key }}/deploy.tar.gz"
+            echo "Deploying ${IMAGE}"
 
-      - name: Upload deploy script to S3
-        run: |
-          aws s3 cp scripts/deploy.sh \
-            "s3://${{ secrets.S3_BUCKET }}/scripts/deploy.sh"
+            echo "${DOCKERHUB_TOKEN}" | docker login \
+              -u "${DOCKERHUB_USERNAME}" \
+              --password-stdin
 
-      - name: Deploy to EC2 via SSM
-        id: deploy
-        run: |
-          OWNER="${{ steps.artifact.outputs.owner }}"
-          REPO="${{ steps.artifact.outputs.repo }}"
-          HASH="${{ steps.artifact.outputs.hash }}"
-          S3_KEY="${{ steps.artifact.outputs.s3_key }}"
-          S3_BUCKET="${{ secrets.S3_BUCKET }}"
+            docker pull "${IMAGE}"
 
-          # Export OAuth secrets as DEPLOY_* env vars for deploy.sh
-          DEPLOY_ENV="export DEPLOY_GITHUB_CLIENT_ID='${{ secrets.OAUTH_CLIENT_ID }}'"
-          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_GITHUB_CLIENT_SECRET='${{ secrets.OAUTH_CLIENT_SECRET }}'"
-          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_JWT_SECRET='${{ secrets.JWT_SECRET }}'"
-          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_DATABASE_URL='${{ secrets.DATABASE_URL }}'"
-          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_UBUNTU_SSH_HOST='${{ secrets.UBUNTU_SSH_HOST }}'"
-          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_UBUNTU_SSH_PORT='${{ secrets.UBUNTU_SSH_PORT }}'"
-          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_UBUNTU_SSH_USER='${{ secrets.UBUNTU_SSH_USER }}'"
-          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_UBUNTU_SSH_PASSWORD='${{ secrets.UBUNTU_SSH_PASSWORD }}'"
-          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_UBUNTU_RUNNER_PATH='${{ secrets.UBUNTU_RUNNER_PATH }}'"
-          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_UBUNTU_WORKING_DIR='${{ secrets.UBUNTU_WORKING_DIR }}'"
-          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_UBUNTU_PYTHON_COMMAND='${{ secrets.UBUNTU_PYTHON_COMMAND }}'"
-          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_WINDOWS_CALLBACK_BASE_URL='https://api.pwd.kr'"
-          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_ENGINE_SHARED_TOKEN='${{ secrets.ENGINE_SHARED_TOKEN }}'"
-          DEPLOY_ENV="${DEPLOY_ENV} && export DEPLOY_ALLOWED_ORIGINS='${{ secrets.ALLOWED_ORIGINS }}'"
+            docker rm -f "${CONTAINER}" 2>/dev/null || true
 
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
-            --document-name "AWS-RunShellScript" \
-            --parameters "{\"commands\":[\"${DEPLOY_ENV} && aws s3 cp s3://${S3_BUCKET}/scripts/deploy.sh /tmp/deploy.sh && chmod +x /tmp/deploy.sh && /tmp/deploy.sh ${OWNER} ${REPO} ${HASH} ${S3_BUCKET} ${S3_KEY}\"]}" \
-            --timeout-seconds 300 \
-            --query "Command.CommandId" \
-            --output text)
+            docker run -d \
+              --name "${CONTAINER}" \
+              --restart unless-stopped \
+              -p 8000:8000 \
+              -e GITHUB_CLIENT_ID="${OAUTH_CLIENT_ID}" \
+              -e GITHUB_CLIENT_SECRET="${OAUTH_CLIENT_SECRET}" \
+              -e GITHUB_REDIRECT_URI="${CALLBACK_BASE_URL}/auth/github/callback" \
+              -e FRONTEND_REDIRECT_URL="${CALLBACK_BASE_URL}/auth/success" \
+              -e JWT_SECRET="${JWT_SECRET}" \
+              -e DATABASE_URL="${DATABASE_URL}" \
+              -e UBUNTU_SSH_HOST="${UBUNTU_SSH_HOST}" \
+              -e UBUNTU_SSH_PORT="${UBUNTU_SSH_PORT}" \
+              -e UBUNTU_SSH_USER="${UBUNTU_SSH_USER}" \
+              -e UBUNTU_SSH_PASSWORD="${UBUNTU_SSH_PASSWORD}" \
+              -e UBUNTU_RUNNER_PATH="${UBUNTU_RUNNER_PATH}" \
+              -e UBUNTU_WORKING_DIR="${UBUNTU_WORKING_DIR}" \
+              -e UBUNTU_PYTHON_COMMAND="${UBUNTU_PYTHON_COMMAND}" \
+              -e WINDOWS_CALLBACK_BASE_URL="${CALLBACK_BASE_URL}" \
+              -e ENGINE_SHARED_TOKEN="${ENGINE_SHARED_TOKEN}" \
+              -e ALLOWED_ORIGINS="${ALLOWED_ORIGINS}" \
+              "${IMAGE}"
 
-          echo "SSM Command ID: ${COMMAND_ID}"
-          echo "command_id=${COMMAND_ID}" >> "$GITHUB_OUTPUT"
+            echo "Waiting for application..."
 
-      - name: Wait for deployment
-        run: |
-          COMMAND_ID="${{ steps.deploy.outputs.command_id }}"
-          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+            for i in $(seq 1 10); do
+              if docker exec "${CONTAINER}" \
+                python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)" \
+                >/dev/null 2>&1; then
 
-          echo "Waiting for SSM command ${COMMAND_ID}..."
-          for i in $(seq 1 30); do
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --query "Status" \
-              --output text 2>/dev/null || echo "InProgress")
+                echo "Deployment successful"
+                docker image prune -f
+                exit 0
+              fi
 
-            if [ "$STATUS" = "Success" ]; then
-              echo "Deployment successful!"
-              aws ssm get-command-invocation \
-                --command-id "$COMMAND_ID" \
-                --instance-id "$INSTANCE_ID" \
-                --query "StandardOutputContent" \
-                --output text
-              exit 0
-            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ] || [ "$STATUS" = "Cancelled" ]; then
-              echo "Deployment failed with status: ${STATUS}"
-              aws ssm get-command-invocation \
-                --command-id "$COMMAND_ID" \
-                --instance-id "$INSTANCE_ID" \
-                --query "StandardErrorContent" \
-                --output text
-              exit 1
-            fi
+              echo "Waiting... (${i}/10)"
+              sleep 3
+            done
 
-            echo "Status: ${STATUS} (attempt ${i}/30)"
-            sleep 10
-          done
-
-          echo "Timed out waiting for deployment"
-          exit 1
-
-      - name: Verify deployment
-        if: success()
-        run: |
-          OWNER="${{ steps.artifact.outputs.owner }}"
-          REPO="${{ steps.artifact.outputs.repo }}"
-          URL="https://api.pwd.kr/${OWNER}/${REPO}/health"
-
-          echo "Checking ${URL}..."
-          for i in $(seq 1 5); do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL" 2>/dev/null || echo "000")
-            if [ "$HTTP_CODE" = "200" ]; then
-              echo "Health check passed!"
-              exit 0
-            fi
-            echo "Attempt ${i}/5 - HTTP ${HTTP_CODE}"
-            sleep 5
-          done
-
-          echo "WARNING: Health check did not return 200, but deployment may still be starting"
+            echo "Health check failed"
+            docker logs --tail 100 "${CONTAINER}" || true
+            exit 1
