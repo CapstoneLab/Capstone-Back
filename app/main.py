@@ -2,17 +2,19 @@ import os
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from hashlib import sha256
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.repos_router import router as repos_router
 from app.auth.jwt_utils import get_current_user
 from app.auth.router import router as auth_router
-from app.db import Base, SessionLocal, engine
+from app.db import Base, SessionLocal, engine, get_db
 from app.db_models import (  # noqa: F401
     ApprovalRecord,
     BuildArtifact,
@@ -101,6 +103,7 @@ def _status_to_error_code(code: int) -> str:
         409: "CONFLICT",
         500: "INTERNAL_SERVER_ERROR",
         502: "BAD_GATEWAY",
+        503: "SERVICE_UNAVAILABLE",
         504: "GATEWAY_TIMEOUT",
     }.get(code, "ERROR")
 
@@ -124,7 +127,7 @@ def health() -> dict[str, str]:
 @app.post("/start-pipeline", response_model=StartPipelineResponse)
 async def start_pipeline(
     req: StartPipelineRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> StartPipelineResponse:
     job_id = str(uuid4())
     now = datetime.now(timezone.utc)
@@ -143,7 +146,8 @@ async def start_pipeline(
                 selected_items=req.selected_items or [],
                 commit_sha=req.commit_sha,
                 created_at=now,
-                user_id=current_user.id,
+                user_id=_authenticated_user_id(current_user),
+                last_event_at=now,
             )
             session.add(job)
             await session.commit()
@@ -179,10 +183,23 @@ async def receive_result(payload: PipelineResultPayload) -> dict[str, str]:
         if not step_data and obj.get("steps"):
             step_data = obj["steps"][-1] if obj["steps"] else {}
         if step_data:
-            job_steps.setdefault(payload.job_id, []).append(step_data)
+            tracked_steps = job_steps.setdefault(payload.job_id, [])
+            step_name = step_data.get("step_name") or step_data.get("name")
+            existing_index = next(
+                (
+                    index
+                    for index, tracked in enumerate(tracked_steps)
+                    if (tracked.get("step_name") or tracked.get("name")) == step_name
+                ),
+                None,
+            )
+            if existing_index is None:
+                tracked_steps.append(step_data)
+            else:
+                tracked_steps[existing_index] = step_data
 
-        # DB에 pipeline_steps INSERT
-        await _save_step_to_db(payload.job_id, step_data)
+        # DB에 pipeline_steps + step_logs upsert. 콜백 재시도 시 중복 행을 만들지 않는다.
+        await _save_step_to_db(payload.job_id, step_data, callback_source="step_complete")
 
         existing = job_state.get(payload.job_id, {})
         existing.update(
@@ -254,10 +271,103 @@ async def _ensure_job_exists(payload: PipelineResultPayload) -> None:
         print(f"[DB] _ensure_job_exists failed: {exc}")
 
 
-async def _save_step_to_db(job_id: str, step_data: dict) -> None:
-    """step_complete 콜백 데이터를 pipeline_steps에 INSERT."""
+def _normalise_step_log_lines(raw_lines: list) -> list[str]:
+    """엔진의 step 로그에서 내부 상태 메타 라인을 제외한다."""
+    lines: list[str] = []
+    for raw in raw_lines:
+        line = str(raw)
+        if line.startswith(("[step_status]", "[step_summary]", "[step_exit_code]", "[exit_code]")):
+            continue
+        lines.append(line)
+    return lines
+
+
+def _log_level(lines: list[str]) -> str:
+    level = "info"
+    for line in lines:
+        lowered = line.lower()
+        if "[error]" in lowered or "error:" in lowered or "exception" in lowered:
+            return "error"
+        if "[warn]" in lowered or "warning" in lowered:
+            level = "warn"
+    return level
+
+
+async def _upsert_step_log(
+    session,
+    *,
+    job_id: str,
+    step_id: str,
+    raw_lines: list,
+    delivery_id: str | None,
+    source: str,
+) -> tuple[int, int]:
+    """step당 로그 한 행을 유지하고, 더 긴 완료 로그를 우선한다."""
+    lines = _normalise_step_log_lines(raw_lines)
+    if not lines:
+        return 0, 0
+
+    content = "\n".join(lines)
+    content_bytes = len(content.encode("utf-8"))
+    digest = sha256(content.encode("utf-8")).hexdigest()
+    now = datetime.now(timezone.utc)
+
+    # HTTP timeout 직후 재시도가 기존 요청과 겹쳐도 step당 하나의
+    # 트랜잭션만 upsert하도록 PostgreSQL advisory lock을 사용한다.
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+        {"lock_key": f"step-log:{step_id}"},
+    )
+
+    result = await session.execute(
+        select(StepLog)
+        .where(StepLog.step_id == step_id)
+        .order_by(StepLog.log_id)
+        .limit(1)
+    )
+    existing = result.scalar_one_or_none()
+    if existing:
+        existing_bytes = existing.size_bytes or len((existing.log_content or "").encode("utf-8"))
+        # pipeline_complete의 전체 로그는 줄 수가 제한될 수 있으므로,
+        # step_complete로 이미 받은 더 긴 로그를 덮어쓰지 않는다.
+        if content_bytes >= existing_bytes:
+            existing.log_level = _log_level(lines)
+            existing.log_content = content
+            existing.delivery_id = delivery_id or existing.delivery_id
+            existing.content_sha256 = digest
+            existing.line_count = len(lines)
+            existing.size_bytes = content_bytes
+            existing.source = source
+            existing.timestamp = now
+            return len(lines), content_bytes
+        return existing.line_count or len((existing.log_content or "").splitlines()), existing_bytes
+
+    session.add(
+        StepLog(
+            job_id=job_id,
+            step_id=step_id,
+            log_level=_log_level(lines),
+            log_content=content,
+            delivery_id=delivery_id,
+            content_sha256=digest,
+            line_count=len(lines),
+            size_bytes=content_bytes,
+            source=source,
+            timestamp=now,
+        )
+    )
+    return len(lines), content_bytes
+
+
+async def _save_step_to_db(
+    job_id: str,
+    step_data: dict,
+    *,
+    callback_source: str = "pipeline_complete",
+) -> str | None:
+    """step와 완료 로그를 upsert하고 job의 히스토리 스냅샷을 갱신한다."""
     if not step_data:
-        return
+        return None
 
     try:
         async with SessionLocal() as session:
@@ -267,33 +377,95 @@ async def _save_step_to_db(job_id: str, step_data: dict) -> None:
             step_status = step_data.get("status", "pending")
             started = _parse_time_safe(step_data.get("started_at"))
             ended = _parse_time_safe(step_data.get("finished_at") or step_data.get("ended_at"))
-            duration = step_data.get("duration_secs") or step_data.get("duration")
+            duration = step_data.get("duration_secs")
+            if duration is None:
+                duration = step_data.get("duration")
             error_msg = step_data.get("error_message") if step_status == "failed" else None
+            step_order_raw = step_data.get("step_order")
+            step_order = int(step_order_raw) if step_order_raw is not None else None
+            now = datetime.now(timezone.utc)
 
-            # 이미 같은 job_id + step_name이 있으면 중복 INSERT 방지
-            existing = await session.execute(
-                select(PipelineStep.step_id)
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+                {"lock_key": f"pipeline-step:{job_id}:{step_name}"},
+            )
+
+            existing_result = await session.execute(
+                select(PipelineStep)
                 .where(PipelineStep.job_id == job_id, PipelineStep.step_name == step_name)
+                .order_by(PipelineStep.created_at)
+                .limit(1)
             )
-            if existing.first():
-                return
+            step = existing_result.scalar_one_or_none()
+            if step:
+                step.step_type = step_type
+                step.status = step_status
+                step.error_message = error_msg
+                step.started_at = started or step.started_at
+                step.ended_at = ended or step.ended_at
+                step.duration_secs = float(duration) if duration is not None else step.duration_secs
+                step.step_order = step_order or step.step_order
+                step.metadata_ = {**(step.metadata_ or {}), **(step_data.get("metadata") or {})}
+            else:
+                step = PipelineStep(
+                    job_id=job_id,
+                    step_name=step_name,
+                    step_type=step_type,
+                    status=step_status,
+                    error_message=error_msg,
+                    started_at=started,
+                    ended_at=ended,
+                    duration_secs=float(duration) if duration is not None else None,
+                    metadata_=step_data.get("metadata", {}),
+                    step_order=step_order,
+                )
+                session.add(step)
+                await session.flush()
 
-            step = PipelineStep(
-                job_id=job_id,
-                step_name=step_name,
-                step_type=step_type,
-                status=step_status,
-                error_message=error_msg,
-                started_at=started,
-                ended_at=ended,
-                duration_secs=float(duration) if duration else None,
-                metadata_=step_data.get("metadata", {}),
+            if callback_source == "step_complete":
+                step.callback_received_at = now
+
+            log_lines = step_data.get("logs") or []
+            if log_lines:
+                line_count, size_bytes = await _upsert_step_log(
+                    session,
+                    job_id=job_id,
+                    step_id=step.step_id,
+                    raw_lines=log_lines,
+                    delivery_id=step_data.get("delivery_id"),
+                    source=callback_source,
+                )
+                step.log_line_count = line_count
+                step.log_size_bytes = size_bytes
+
+            # job 행은 사용자별 실행 히스토리이며, 최근 step 상태를 같이 저장한다.
+            counts_result = await session.execute(
+                select(
+                    func.count(PipelineStep.step_id),
+                    func.count(PipelineStep.step_id).filter(
+                        PipelineStep.status.in_(["success", "failed", "skipped"])
+                    ),
+                ).where(PipelineStep.job_id == job_id)
             )
-            session.add(step)
+            actual_total, completed = counts_result.one()
+            total_hint_raw = step_data.get("total_steps")
+            total_hint = int(total_hint_raw) if total_hint_raw is not None else None
+            job = await session.get(PipelineJob, job_id)
+            if job:
+                job.latest_step_name = step_name
+                job.completed_steps = int(completed or 0)
+                job.total_steps = max(int(actual_total or 0), total_hint or 0) or None
+                job.last_event_at = now
+
             await session.commit()
-            print(f"[DB] pipeline_steps INSERT: {job_id} / {step_name} = {step_status}")
+            print(
+                f"[DB] pipeline_steps UPSERT: {job_id} / {step_name} = {step_status} "
+                f"logs={step.log_line_count or 0}"
+            )
+            return step.step_id
     except Exception as exc:
         print(f"[DB] _save_step_to_db failed: {exc}")
+        return None
 
 
 async def _finalize_job_in_db(payload: PipelineResultPayload, obj: dict) -> None:
@@ -327,6 +499,7 @@ async def _finalize_job_in_db(payload: PipelineResultPayload, obj: dict) -> None
                     completed_at=ended,
                     duration_secs=duration,
                     metadata_=obj.get("metadata", {}),
+                    last_event_at=ended,
                 )
             )
             await session.commit()
@@ -334,7 +507,7 @@ async def _finalize_job_in_db(payload: PipelineResultPayload, obj: dict) -> None
 
             # obj["steps"]에 있지만 DB에 아직 없는 step들 저장
             for s in obj.get("steps", []):
-                await _save_step_to_db(payload.job_id, s)
+                await _save_step_to_db(payload.job_id, s, callback_source="pipeline_complete")
 
     except Exception as exc:
         print(f"[DB] _finalize_job_in_db failed: {exc}")
@@ -765,10 +938,9 @@ def _parse_deploy_info(steps_data: list[dict]) -> dict | None:
 
 
 async def _save_log_lines(session, job_id: str, logs: list[str], step_map: dict[str, str]) -> None:
-    """로그 라인을 step별로 모아서, step 하나당 row 하나로 저장."""
+    """최종 콜백 로그를 step별로 모아 기존 step 로그에 upsert."""
     # step별로 로그 라인 모으기
     step_logs_map: dict[str, list[str]] = {}
-    step_level_map: dict[str, str] = {}  # step별 최고 로그 레벨 추적
 
     for line in logs:
         match = re.match(r"^\[([^.\]]+)\.log\]\s*(?:\[[^\]]*\]\s*)?(.*)", line)
@@ -787,28 +959,25 @@ async def _save_log_lines(session, job_id: str, logs: list[str], step_map: dict[
 
         step_logs_map.setdefault(step_name, []).append(content)
 
-        # 로그 레벨: error > warn > info (가장 높은 레벨을 step 전체에 적용)
-        content_lower = content.lower()
-        if "[error]" in content_lower or "error:" in content_lower or "exception" in content_lower:
-            step_level_map[step_name] = "error"
-        elif "[warn]" in content_lower or "warning" in content_lower:
-            if step_level_map.get(step_name) != "error":
-                step_level_map[step_name] = "warn"
-
-    # step별로 합쳐서 하나의 row로 INSERT
+    # step별로 합쳐서 하나의 row로 upsert. step_complete에서
+    # 이미 받은 더 긴 로그는 _upsert_step_log에서 보존된다.
     for step_name, lines in step_logs_map.items():
         step_id = step_map.get(step_name)
         if not step_id:
             continue
-        combined = "\n".join(lines)
-        log_level = step_level_map.get(step_name, "info")
-
-        session.add(StepLog(
+        line_count, size_bytes = await _upsert_step_log(
+            session,
             job_id=job_id,
             step_id=step_id,
-            log_level=log_level,
-            log_content=combined,
-        ))
+            raw_lines=lines,
+            delivery_id=None,
+            source="pipeline_complete",
+        )
+        await session.execute(
+            update(PipelineStep)
+            .where(PipelineStep.step_id == step_id)
+            .values(log_line_count=line_count, log_size_bytes=size_bytes)
+        )
 
 
 def _parse_build_artifacts(steps_data: list[dict], project_type: str = "") -> list[dict]:
@@ -1209,7 +1378,13 @@ async def claim_job(job_id: str, request: Request) -> dict:
             await session.execute(
                 update(PipelineJob)
                 .where(PipelineJob.job_id == job_id, PipelineJob.status == "queued")
-                .values(status="running", started_at=now, claimed_at=now, claimed_by=engine_id)
+                .values(
+                    status="running",
+                    started_at=now,
+                    claimed_at=now,
+                    claimed_by=engine_id,
+                    last_event_at=now,
+                )
             )
             await session.commit()
             await session.refresh(job)
@@ -1244,6 +1419,10 @@ async def get_job_detail(job_id: str) -> dict:
                 "started_at": job.started_at.isoformat() if job.started_at else None,
                 "completed_at": job.completed_at.isoformat() if job.completed_at else None,
                 "duration_secs": job.duration_secs,
+                "latest_step_name": job.latest_step_name,
+                "completed_steps": job.completed_steps,
+                "total_steps": job.total_steps,
+                "last_event_at": job.last_event_at.isoformat() if job.last_event_at else None,
                 "metadata": job.metadata_,
             }
 
@@ -1267,6 +1446,10 @@ async def get_job_detail(job_id: str) -> dict:
                     "started_at": step.started_at.isoformat() if step.started_at else None,
                     "ended_at": step.ended_at.isoformat() if step.ended_at else None,
                     "duration_secs": duration,
+                    "step_order": step.step_order,
+                    "log_line_count": step.log_line_count,
+                    "log_size_bytes": step.log_size_bytes,
+                    "callback_received_at": step.callback_received_at.isoformat() if step.callback_received_at else None,
                 })
 
             # 현재 진행 중인 step
@@ -1364,6 +1547,87 @@ def pipeline_steps(job_id: str = Query(..., min_length=1)) -> dict:
 
 # ── /api/pipelines — 프론트엔드 API 스펙 ─────────────────────────────────────
 
+def _authenticated_user_id(current_user: User | dict) -> int:
+    user_id = current_user.get("id") if isinstance(current_user, dict) else getattr(current_user, "id", None)
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="authenticated user id is missing")
+    return int(user_id)
+
+
+@app.get("/api/pipelines/history")
+async def get_pipeline_history(
+    status_filter: str | None = Query(None, alias="status"),
+    repo: str | None = Query(None, description="repo_url 부분 검색"),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """현재 로그인한 사용자가 실행한 파이프라인 히스토리를 최신 순으로 반환."""
+    valid_statuses = {"queued", "running", "success", "failed", "cancelled"}
+    if status_filter and status_filter not in valid_statuses:
+        raise HTTPException(status_code=400, detail=f"unsupported status: {status_filter}")
+
+    conditions = [PipelineJob.user_id == _authenticated_user_id(current_user)]
+    if status_filter:
+        conditions.append(PipelineJob.status == status_filter)
+    if repo:
+        conditions.append(PipelineJob.repo_url.ilike(f"%{repo.strip()}%"))
+
+    # get_current_user와 같은 get_db 의존성을 공유해 요청당 DB 연결을
+    # 하나만 사용한다. 연결 제한이 작은 DB에서도 대기하지 않는다.
+    total_result = await db.execute(
+        select(func.count(PipelineJob.job_id)).where(*conditions)
+    )
+    total = int(total_result.scalar_one() or 0)
+    jobs_result = await db.execute(
+        select(PipelineJob)
+        .where(*conditions)
+        .order_by(PipelineJob.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    jobs = jobs_result.scalars().all()
+
+    items = []
+    for job in jobs:
+        completed_steps = int(job.completed_steps or 0)
+        total_steps = int(job.total_steps or 0)
+        if total_steps:
+            progress_percent = min(100, round(completed_steps * 100 / total_steps))
+        else:
+            progress_percent = 100 if job.status in ("success", "failed", "cancelled") else 0
+        items.append({
+            "job_id": job.job_id,
+            "repo_url": job.repo_url,
+            "branch": job.branch,
+            "trigger_source": job.trigger_source,
+            "status": job.status,
+            "overall_result": job.overall_result,
+            "source": job.source,
+            "environment": job.environment,
+            "commit_sha": job.commit_sha,
+            "selected_items": job.selected_items or [],
+            "latest_step_name": job.latest_step_name,
+            "completed_steps": completed_steps,
+            "total_steps": total_steps,
+            "progress_percent": progress_percent,
+            "created_at": job.created_at.isoformat() if job.created_at else None,
+            "started_at": job.started_at.isoformat() if job.started_at else None,
+            "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            "last_event_at": job.last_event_at.isoformat() if job.last_event_at else None,
+            "duration_secs": job.duration_secs,
+        })
+
+    return {
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": offset + len(items) < total,
+    }
+
+
 @app.post("/api/pipelines", status_code=status.HTTP_202_ACCEPTED)
 async def create_pipeline(
     req: StartPipelineRequest,
@@ -1424,12 +1688,17 @@ async def create_pipeline(
                 commit_sha=req.commit_sha,
                 created_at=now,
                 user_id=current_user.get("id") if isinstance(current_user, dict) else getattr(current_user, "id", None),
+                last_event_at=now,
             )
             session.add(job)
             await session.commit()
             print(f"[DB] pipeline_jobs INSERT (pending): {job_id}")
     except Exception as exc:
         print(f"[DB] pipeline_jobs INSERT failed: {exc}")
+        raise HTTPException(
+            status_code=503,
+            detail="pipeline history database is unavailable",
+        ) from exc
 
     return {
         "job_id": job_id,
@@ -1458,7 +1727,7 @@ async def cancel_pipeline(
         await session.execute(
             update(PipelineJob)
             .where(PipelineJob.job_id == job_id)
-            .values(status="cancelled", completed_at=now)
+            .values(status="cancelled", completed_at=now, last_event_at=now)
         )
         await session.commit()
 
@@ -1562,6 +1831,10 @@ async def get_pipeline_steps(job_id: str) -> dict:
                     "started_at": step.started_at.isoformat() if step.started_at else None,
                     "ended_at": step.ended_at.isoformat() if step.ended_at else None,
                     "duration_secs": duration,
+                    "step_order": step.step_order,
+                    "log_line_count": step.log_line_count,
+                    "log_size_bytes": step.log_size_bytes,
+                    "callback_received_at": step.callback_received_at.isoformat() if step.callback_received_at else None,
                 })
 
             job_summary = None
@@ -1573,6 +1846,10 @@ async def get_pipeline_steps(job_id: str) -> dict:
                     "started_at": job.started_at.isoformat() if job.started_at else None,
                     "completed_at": job.completed_at.isoformat() if job.completed_at else None,
                     "duration_secs": job.duration_secs,
+                    "latest_step_name": job.latest_step_name,
+                    "completed_steps": job.completed_steps,
+                    "total_steps": job.total_steps,
+                    "last_event_at": job.last_event_at.isoformat() if job.last_event_at else None,
                 }
 
         if steps_list or job_summary:

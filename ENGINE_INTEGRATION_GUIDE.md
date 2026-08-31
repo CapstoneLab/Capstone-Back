@@ -286,10 +286,21 @@ Content-Type: application/json
     "finished_at": "2026-05-30T10:01:45+00:00",
     "duration_secs": 45.2,
     "error_message": null,
+    "step_order": 2,
+    "total_steps": 6,
+    "delivery_id": "a deterministic sha256 value",
+    "logs": [
+      "[INFO] gitleaks scan started",
+      "[INFO] no leaks found"
+    ],
     "metadata": {}
   }
 }
 ```
+
+`delivery_id`는 같은 step 완료 콜백의 재시도 여부를 식별하는 결정적(deterministic) ID입니다.
+백엔드는 `pipeline_steps`와 `step_logs`를 upsert하므로 재시도해도 동일 step 로그가
+중복 적재되지 않습니다. 엔진은 일시적인 전송 실패에 대해 1초, 3초, 10초 간격으로 재시도합니다.
 
 **Response 200**
 ```json
@@ -529,6 +540,7 @@ verdict = "block"
 | Method | Path | 설명 |
 |--------|------|------|
 | `POST` | `/api/pipelines` | 파이프라인 시작 (selected_items 포함) |
+| `GET` | `/api/pipelines/history` | 현재 사용자의 파이프라인 실행 히스토리 (필터/페이징) |
 | `GET` | `/api/jobs/{job_id}` | job 상태 + steps + security 요약 |
 | `GET` | `/api/jobs/{job_id}/result` | 보안 결과 상세 (findings + verdict 전체) |
 | `GET` | `/api/jobs/{job_id}/findings` | finding 목록만 조회 |

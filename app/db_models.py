@@ -81,6 +81,12 @@ class PipelineJob(Base):
     user_id: Mapped[int | None] = mapped_column(BigInteger)
     approved_cwes: Mapped[list | None] = mapped_column(JSONB, default=list)
     approval_record_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False))
+    # 사용자별 실행 이력 화면에서 매번 steps 전체를 집계하지 않아도 되도록
+    # 마지막으로 수신한 step 진행 상태를 스냅샷으로 유지한다.
+    latest_step_name: Mapped[str | None] = mapped_column(String(100))
+    completed_steps: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    total_steps: Mapped[int | None] = mapped_column(Integer)
+    last_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class PipelineStep(Base):
@@ -99,6 +105,10 @@ class PipelineStep(Base):
     duration_secs: Mapped[float | None] = mapped_column(Float)
     metadata_: Mapped[dict | None] = mapped_column("metadata", JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.current_timestamp())
+    step_order: Mapped[int | None] = mapped_column(Integer)
+    log_line_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    log_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    callback_received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class StepLog(Base):
@@ -112,6 +122,11 @@ class StepLog(Base):
     log_level: Mapped[str] = mapped_column(String(10), nullable=False, default="info")
     log_content: Mapped[str] = mapped_column(Text, nullable=False)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.current_timestamp())
+    delivery_id: Mapped[str | None] = mapped_column(String(128))
+    content_sha256: Mapped[str | None] = mapped_column(String(64))
+    line_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    source: Mapped[str] = mapped_column(String(30), nullable=False, default="pipeline_complete", server_default="pipeline_complete")
 
 
 class SecurityFinding(Base):
