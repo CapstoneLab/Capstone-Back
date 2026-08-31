@@ -23,6 +23,9 @@ def test_cd_connects_backend_to_public_ingress_routes() -> None:
     assert 'NETWORK="capstone-internal"' in workflow
     assert '--network "${NETWORK}"' in workflow
     assert "--network-alias backend" in workflow
+    assert 'ROUTES_DIR="$(docker inspect' in workflow
+    assert 'cat <<\'NGINX_ROUTE\' > "${ROUTES_DIR}/capstone-back.conf"' in workflow
+    assert "docker exec -i" not in workflow
     assert "location = /docs" in workflow
     assert "location = /openapi.json" in workflow
     assert "location = /redoc" in workflow

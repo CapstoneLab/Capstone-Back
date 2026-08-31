@@ -105,7 +105,15 @@ jobs:
                 python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)" \
                 >/dev/null 2>&1; then
 
-                cat <<'NGINX_ROUTE' | docker exec -i "${ROUTER}" sh -c 'cat > /etc/nginx/routes/capstone-back.conf'
+                ROUTES_DIR="$(docker inspect "${ROUTER}" --format '{{range .Mounts}}{{if eq .Destination "/etc/nginx/routes"}}{{.Source}}{{end}}{{end}}')"
+                if [ -z "${ROUTES_DIR}" ] || [ ! -d "${ROUTES_DIR}" ]; then
+                  echo "Router host routes directory not found"
+                  exit 1
+                fi
+
+                # /etc/nginx/routes is intentionally read-only inside the
+                # router. Write to its bind-mount source on the host instead.
+                cat <<'NGINX_ROUTE' > "${ROUTES_DIR}/capstone-back.conf"
             location = /health {
               set $capstone_backend capstone-back:8000;
               proxy_pass http://$capstone_backend;
