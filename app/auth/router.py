@@ -3,6 +3,7 @@ import tempfile
 
 from html import escape
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -29,6 +30,11 @@ settings = get_settings()
 OAUTH_STATE_COOKIE = "gh_oauth_state"
 
 
+def _oauth_cookie_secure() -> bool:
+    """Only mark the state cookie secure when the configured callback uses HTTPS."""
+    return urlparse(settings.github_redirect_uri).scheme.lower() == "https"
+
+
 @router.get("/github/login")
 async def github_login() -> Response:
     state = secrets.token_urlsafe(32)
@@ -40,7 +46,7 @@ async def github_login() -> Response:
         max_age=600,
         httponly=True,
         samesite="lax",
-        secure=False,
+        secure=_oauth_cookie_secure(),
     )
     return resp
 
@@ -111,7 +117,12 @@ async def github_callback(
 
     redirect_target = f"{settings.frontend_redirect_url}?token={jwt_token}"
     resp = RedirectResponse(url=redirect_target, status_code=302)
-    resp.delete_cookie(OAUTH_STATE_COOKIE)
+    resp.delete_cookie(
+        OAUTH_STATE_COOKIE,
+        httponly=True,
+        samesite="lax",
+        secure=_oauth_cookie_secure(),
+    )
     return resp
 
 
@@ -137,9 +148,9 @@ button {{ padding: 8px 14px; font-size: 14px; cursor: pointer; }}
 .ok {{ color: #0a7d2e; font-weight: 600; }}
 </style></head><body>
 <h1>✅ <span class="ok">GitHub 로그인 성공</span></h1>
-<p>아래 JWT를 복사하고, <a href="{prefix}/docs" target="_blank">/docs</a>의 우측 상단
-<strong>Authorize</strong> 버튼을 눌러 <code>Bearer &lt;토큰&gt;</code> 형태로 넣은 뒤
-<code>/auth/me</code>를 호출해보세요.</p>
+<p>아래 <strong>/auth/me 호출</strong> 버튼으로 로그인 정보를 바로 확인할 수 있습니다.
+<a href="{prefix}/docs" target="_blank">/docs</a>에서 테스트할 때는 우측 상단
+<strong>Authorize</strong>에 JWT 토큰만 입력하세요.</p>
 <textarea id="tk" readonly onclick="this.select()">{safe_token}</textarea>
 <p>
   <button onclick="navigator.clipboard.writeText(document.getElementById('tk').value)">

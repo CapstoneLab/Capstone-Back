@@ -40,20 +40,24 @@ jobs:
           ENGINE_SHARED_TOKEN: ${{ secrets.ENGINE_SHARED_TOKEN }}
           ALLOWED_ORIGINS: ${{ secrets.ALLOWED_ORIGINS }}
 
-          CALLBACK_BASE_URL: http://${{ secrets.SERVER_HOST }}:8000
+          # OAuth callback must use the browser-reachable HTTPS ingress.
+          # SERVER_HOST is only the SSH destination and port 8000 is not public.
+          PUBLIC_BASE_URL: https://112.186.136.153
 
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
 
-          envs: DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,IMAGE_TAG,OAUTH_CLIENT_ID,OAUTH_CLIENT_SECRET,JWT_SECRET,DATABASE_URL,UBUNTU_SSH_HOST,UBUNTU_SSH_PORT,UBUNTU_SSH_USER,UBUNTU_SSH_PASSWORD,UBUNTU_RUNNER_PATH,UBUNTU_WORKING_DIR,UBUNTU_PYTHON_COMMAND,ENGINE_SHARED_TOKEN,ALLOWED_ORIGINS,CALLBACK_BASE_URL
+          envs: DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,IMAGE_TAG,OAUTH_CLIENT_ID,OAUTH_CLIENT_SECRET,JWT_SECRET,DATABASE_URL,UBUNTU_SSH_HOST,UBUNTU_SSH_PORT,UBUNTU_SSH_USER,UBUNTU_SSH_PASSWORD,UBUNTU_RUNNER_PATH,UBUNTU_WORKING_DIR,UBUNTU_PYTHON_COMMAND,ENGINE_SHARED_TOKEN,ALLOWED_ORIGINS,PUBLIC_BASE_URL
 
           script: |
             set -e
 
             IMAGE="${DOCKERHUB_USERNAME}/capstone-back:${IMAGE_TAG}"
             CONTAINER="capstone-back"
+            NETWORK="capstone-internal"
+            ROUTER="capstone-deploy-router"
 
             echo "Deploying ${IMAGE}"
 
@@ -63,16 +67,24 @@ jobs:
 
             docker pull "${IMAGE}"
 
+            # The public Caddy ingress forwards to this router. Keeping the
+            # backend on the same network makes /auth and /api reachable over
+            # the public HTTPS address without exposing port 8000 directly.
+            docker network inspect "${NETWORK}" >/dev/null
+            docker inspect "${ROUTER}" >/dev/null
+
             docker rm -f "${CONTAINER}" 2>/dev/null || true
 
             docker run -d \
               --name "${CONTAINER}" \
               --restart unless-stopped \
+              --network "${NETWORK}" \
+              --network-alias backend \
               -p 8000:8000 \
               -e GITHUB_CLIENT_ID="${OAUTH_CLIENT_ID}" \
               -e GITHUB_CLIENT_SECRET="${OAUTH_CLIENT_SECRET}" \
-              -e GITHUB_REDIRECT_URI="${CALLBACK_BASE_URL}/auth/github/callback" \
-              -e FRONTEND_REDIRECT_URL="${CALLBACK_BASE_URL}/auth/success" \
+              -e GITHUB_REDIRECT_URI="${PUBLIC_BASE_URL}/auth/github/callback" \
+              -e FRONTEND_REDIRECT_URL="${PUBLIC_BASE_URL}/auth/success" \
               -e JWT_SECRET="${JWT_SECRET}" \
               -e DATABASE_URL="${DATABASE_URL}" \
               -e UBUNTU_SSH_HOST="${UBUNTU_SSH_HOST}" \
@@ -82,7 +94,6 @@ jobs:
               -e UBUNTU_RUNNER_PATH="${UBUNTU_RUNNER_PATH}" \
               -e UBUNTU_WORKING_DIR="${UBUNTU_WORKING_DIR}" \
               -e UBUNTU_PYTHON_COMMAND="${UBUNTU_PYTHON_COMMAND}" \
-              -e WINDOWS_CALLBACK_BASE_URL="${CALLBACK_BASE_URL}" \
               -e ENGINE_SHARED_TOKEN="${ENGINE_SHARED_TOKEN}" \
               -e ALLOWED_ORIGINS="${ALLOWED_ORIGINS}" \
               "${IMAGE}"
@@ -94,7 +105,56 @@ jobs:
                 python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)" \
                 >/dev/null 2>&1; then
 
-                echo "Deployment successful"
+                cat <<'NGINX_ROUTE' | docker exec -i "${ROUTER}" sh -c 'cat > /etc/nginx/routes/capstone-back.conf'
+            location = /health {
+              set $capstone_backend capstone-back:8000;
+              proxy_pass http://$capstone_backend;
+            }
+            location = /docs {
+              set $capstone_backend capstone-back:8000;
+              proxy_pass http://$capstone_backend;
+              proxy_set_header Host $http_host;
+              proxy_set_header X-Forwarded-Proto $cicd_forwarded_proto;
+            }
+            location = /openapi.json {
+              set $capstone_backend capstone-back:8000;
+              proxy_pass http://$capstone_backend;
+              proxy_set_header Host $http_host;
+              proxy_set_header X-Forwarded-Proto $cicd_forwarded_proto;
+            }
+            location = /redoc {
+              set $capstone_backend capstone-back:8000;
+              proxy_pass http://$capstone_backend;
+              proxy_set_header Host $http_host;
+              proxy_set_header X-Forwarded-Proto $cicd_forwarded_proto;
+            }
+            location ^~ /auth/ {
+              set $capstone_backend capstone-back:8000;
+              proxy_pass http://$capstone_backend;
+              proxy_set_header Host $http_host;
+              proxy_set_header X-Real-IP $cicd_real_ip;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Host $cicd_forwarded_host;
+              proxy_set_header X-Forwarded-Proto $cicd_forwarded_proto;
+              proxy_set_header X-Forwarded-Port $cicd_forwarded_port;
+            }
+            location ^~ /api/ {
+              set $capstone_backend capstone-back:8000;
+              proxy_pass http://$capstone_backend;
+              proxy_set_header Host $http_host;
+              proxy_set_header X-Real-IP $cicd_real_ip;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Host $cicd_forwarded_host;
+              proxy_set_header X-Forwarded-Proto $cicd_forwarded_proto;
+              proxy_set_header X-Forwarded-Port $cicd_forwarded_port;
+            }
+            NGINX_ROUTE
+
+                docker exec "${ROUTER}" nginx -t
+                docker exec "${ROUTER}" nginx -s reload
+
+                curl --fail --silent --show-error "${PUBLIC_BASE_URL}/health" >/dev/null
+                echo "Deployment successful: OAuth callback=${PUBLIC_BASE_URL}/auth/github/callback"
                 docker image prune -f
                 exit 0
               fi
