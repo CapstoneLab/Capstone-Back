@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     engine_shared_token: str = Field(default="", alias="ENGINE_SHARED_TOKEN")
     trusted_proxies: str = Field(default="cloudflare", alias="TRUSTED_PROXIES")
     allowed_origins: str = Field(default="", alias="ALLOWED_ORIGINS")
+    engine_start_timeout_sec: int = Field(default=300, alias="ENGINE_START_TIMEOUT_SEC")
+    pipeline_callback_timeout_sec: int = Field(default=1800, alias="PIPELINE_CALLBACK_TIMEOUT_SEC")
+    stuck_job_reaper_interval_sec: int = Field(default=60, alias="STUCK_JOB_REAPER_INTERVAL_SEC")
 
 
 @lru_cache

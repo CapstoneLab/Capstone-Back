@@ -76,6 +76,7 @@ def test_realtime_and_deployment_routes_are_registered() -> None:
 
     assert "/api/pipelines/{job_id}/logs/ws" in paths
     assert "/api/pipelines/{job_id}/deployment" in paths
+    assert "/api/jobs/{job_id}/fail" in paths
 
 
 def test_timestamped_internal_step_metadata_is_filtered() -> None:

@@ -2,15 +2,16 @@ import asyncio
 import os
 import re
 import secrets
+import contextlib
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from hashlib import sha256
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
-from sqlalchemy import func, select, text, update
+from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.repos_router import router as repos_router
@@ -42,16 +43,24 @@ from app.realtime import pipeline_event_hub
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    reaper_task: asyncio.Task | None = None
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         print("[startup] DB connected, tables ensured.")
+        reaper_task = asyncio.create_task(_stuck_job_reaper())
     except Exception as exc:
         print(
             f"[startup] WARNING: DB init skipped ({exc.__class__.__name__}: {exc}). "
             "Server will run, but /auth/* endpoints will fail until DB is reachable."
         )
-    yield
+    try:
+        yield
+    finally:
+        if reaper_task:
+            reaper_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reaper_task
 
 
 app = FastAPI(
@@ -182,6 +191,10 @@ async def receive_result(payload: PipelineResultPayload, request: Request) -> di
 
     # DB에 job이 없으면 자동 생성 (외부에서 직접 콜백 온 경우)
     await _ensure_job_exists(payload)
+    terminal_status = await _get_terminal_job_status(payload.job_id)
+    if terminal_status:
+        print(f"[callback] ignored late {cb_type} for terminal job {payload.job_id} ({terminal_status})")
+        return {"message": "job already terminal", "status": terminal_status}
 
     if cb_type == "log_batch":
         accepted_events = await _append_stream_log_batch(payload)
@@ -303,6 +316,135 @@ def _verify_callback_token(request: Request) -> None:
     received = request.headers.get("x-callback-token", "")
     if not secrets.compare_digest(received, expected):
         raise HTTPException(status_code=401, detail="invalid callback token")
+
+
+async def _ensure_claim_step(session: AsyncSession, job_id: str, now: datetime) -> None:
+    """Create a visible first step as soon as an engine claims the job."""
+    result = await session.execute(
+        select(PipelineStep.step_id)
+        .where(PipelineStep.job_id == job_id, PipelineStep.step_name == "clone")
+        .limit(1)
+    )
+    if result.first():
+        return
+    session.add(
+        PipelineStep(
+            job_id=job_id,
+            step_name="clone",
+            step_type="clone",
+            status="running",
+            started_at=now,
+            step_order=1,
+            metadata_={"source": "engine_claim"},
+        )
+    )
+
+
+async def _fail_job_in_db(job_id: str, reason: str, detail: str | None = None) -> bool:
+    """Move a non-terminal job and any running steps to failed."""
+    now = datetime.now(timezone.utc)
+    try:
+        async with SessionLocal() as session:
+            job = await session.get(PipelineJob, job_id)
+            if not job:
+                return False
+            if job.status not in {"queued", "running"}:
+                return False
+
+            metadata = dict(job.metadata_ or {})
+            metadata["failure_reason"] = reason
+            if detail:
+                metadata["failure_detail"] = detail[:2000]
+            metadata["failed_by"] = "backend"
+
+            job.status = "failed"
+            job.overall_result = "failed"
+            job.completed_at = now
+            job.last_event_at = now
+            job.metadata_ = metadata
+            if job.started_at:
+                job.duration_secs = int((now - job.started_at).total_seconds())
+
+            result = await session.execute(
+                select(PipelineStep)
+                .where(PipelineStep.job_id == job_id, PipelineStep.status == "running")
+            )
+            for step in result.scalars().all():
+                step.status = "failed"
+                step.ended_at = now
+                step.error_message = reason if not detail else f"{reason}: {detail[:500]}"
+                if step.started_at:
+                    step.duration_secs = round((now - step.started_at).total_seconds(), 2)
+
+            await session.commit()
+            await pipeline_event_hub.publish(
+                job_id,
+                {
+                    "schema_version": 1,
+                    "type": "pipeline_complete",
+                    "job_id": job_id,
+                    "status": "failed",
+                    "error": reason,
+                    "detail": detail,
+                    "ended_at": now.isoformat(),
+                },
+            )
+            await pipeline_event_hub.clear(job_id)
+            job_state.pop(job_id, None)
+            job_steps.pop(job_id, None)
+            print(f"[stuck-job] {job_id} -> failed ({reason})")
+            return True
+    except Exception as exc:
+        print(f"[stuck-job] failed to mark {job_id}: {exc}")
+        return False
+
+
+async def _find_stuck_jobs() -> list[tuple[str, str]]:
+    settings = get_settings()
+    now = datetime.now(timezone.utc)
+    start_cutoff = now - timedelta(seconds=max(60, settings.engine_start_timeout_sec))
+    callback_cutoff = now - timedelta(seconds=max(60, settings.pipeline_callback_timeout_sec))
+    stuck: list[tuple[str, str]] = []
+
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(PipelineJob)
+            .where(PipelineJob.status == "running")
+            .where(or_(
+                PipelineJob.last_event_at.is_(None),
+                PipelineJob.last_event_at < callback_cutoff,
+                and_(PipelineJob.claimed_at.is_not(None), PipelineJob.claimed_at < start_cutoff),
+            ))
+        )
+        for job in result.scalars().all():
+            counts = await session.execute(
+                select(
+                    func.count(PipelineStep.step_id),
+                    func.count(PipelineStep.step_id).filter(PipelineStep.callback_received_at.is_not(None)),
+                    func.coalesce(func.sum(PipelineStep.log_line_count), 0),
+                ).where(PipelineStep.job_id == job.job_id)
+            )
+            step_count, callback_count, log_line_count = counts.one()
+            if job.claimed_at and job.claimed_at < start_cutoff and callback_count == 0 and log_line_count == 0:
+                stuck.append((job.job_id, "engine_start_timeout"))
+            elif job.last_event_at and job.last_event_at < callback_cutoff:
+                stuck.append((job.job_id, "pipeline_callback_timeout"))
+            elif not job.last_event_at and step_count == 0:
+                stuck.append((job.job_id, "pipeline_callback_timeout"))
+
+    return stuck
+
+
+async def _stuck_job_reaper() -> None:
+    settings = get_settings()
+    interval = max(10, settings.stuck_job_reaper_interval_sec)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            for job_id, reason in await _find_stuck_jobs():
+                await _fail_job_in_db(job_id, reason)
+        except Exception as exc:
+            print(f"[stuck-job] reaper error: {exc}")
 
 
 async def _append_stream_log_batch(payload: PipelineResultPayload) -> list[dict]:
@@ -444,6 +586,17 @@ async def _ensure_job_exists(payload: PipelineResultPayload) -> None:
                 print(f"[DB] pipeline_jobs auto-created: {payload.job_id}")
     except Exception as exc:
         print(f"[DB] _ensure_job_exists failed: {exc}")
+
+
+async def _get_terminal_job_status(job_id: str) -> str | None:
+    try:
+        async with SessionLocal() as session:
+            job = await session.get(PipelineJob, job_id)
+            if job and job.status in {"success", "failed", "cancelled"}:
+                return job.status
+    except Exception as exc:
+        print(f"[DB] terminal status check failed: {exc}")
+    return None
 
 
 def _normalise_step_log_lines(raw_lines: list) -> list[str]:
@@ -1569,6 +1722,7 @@ async def claim_job(job_id: str, request: Request) -> dict:
                     last_event_at=now,
                 )
             )
+            await _ensure_claim_step(session, job_id, now)
             await session.commit()
             await session.refresh(job)
             print(f"[engine] job claimed: {job_id} by {engine_id}")
@@ -1577,6 +1731,22 @@ async def claim_job(job_id: str, request: Request) -> dict:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/jobs/{job_id}/fail")
+async def fail_job(job_id: str, request: Request) -> dict:
+    """엔진이 시작 실패/프로세스 비정상 종료를 명시적으로 보고한다."""
+    _verify_engine_token(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    reason = str(body.get("reason") or "engine_unreachable")
+    detail = body.get("detail")
+    changed = await _fail_job_in_db(job_id, reason, str(detail) if detail is not None else None)
+    if not changed:
+        return {"job_id": job_id, "status": "unchanged", "reason": reason}
+    return {"job_id": job_id, "status": "failed", "reason": reason}
 
 
 # ── /api/jobs/{job_id} — 프론트엔드용 상세 조회 API ──────────────────────────
