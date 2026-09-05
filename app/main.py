@@ -1,11 +1,13 @@
+import asyncio
 import os
 import re
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from hashlib import sha256
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import func, select, text, update
@@ -13,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.repos_router import router as repos_router
 from app.auth.jwt_utils import get_current_user
+from app.auth.jwt_utils import decode_token
 from app.auth.router import router as auth_router
 from app.db import Base, SessionLocal, engine, get_db
 from app.db_models import (  # noqa: F401
@@ -34,6 +37,7 @@ from app.models import (
 )
 from app.config import get_settings
 from app.service import ResultStore, TriggerService, UbuntuResultFetcher
+from app.realtime import pipeline_event_hub
 
 
 @asynccontextmanager
@@ -170,13 +174,30 @@ async def start_pipeline(
 
 
 @app.post("/get-results")
-async def receive_result(payload: PipelineResultPayload) -> dict[str, str]:
+async def receive_result(payload: PipelineResultPayload, request: Request) -> dict[str, str | int]:
+    _verify_callback_token(request)
     obj = payload.model_dump(mode="json")
     cb_type = payload.callback_type
     print(f"[DEBUG callback] job_id={payload.job_id} type={cb_type} effective_status={payload.effective_status} step_name={payload.step.get('name', 'N/A')}")
 
     # DB에 job이 없으면 자동 생성 (외부에서 직접 콜백 온 경우)
     await _ensure_job_exists(payload)
+
+    if cb_type == "log_batch":
+        accepted_events = await _append_stream_log_batch(payload)
+        event = {
+            "schema_version": payload.schema_version,
+            "type": "log_batch",
+            "event_id": payload.event_id,
+            "job_id": payload.job_id,
+            "run_id": payload.run_id or payload.metadata.get("run_id"),
+            "sequence_start": payload.sequence_start,
+            "sequence_end": payload.sequence_end,
+            "events": accepted_events,
+        }
+        if accepted_events:
+            await pipeline_event_hub.publish(payload.job_id, event)
+        return {"message": "logs recorded", "accepted": len(accepted_events)}
 
     if cb_type == "step_complete":
         step_data = payload.step or {}
@@ -211,6 +232,18 @@ async def receive_result(payload: PipelineResultPayload) -> dict[str, str]:
             }
         )
         job_state[payload.job_id] = existing
+        if payload.deployment:
+            await _save_deployment_snapshot(payload.job_id, payload.deployment)
+        await pipeline_event_hub.publish(
+            payload.job_id,
+            {
+                "schema_version": 1,
+                "type": "step_complete",
+                "job_id": payload.job_id,
+                "step": {key: value for key, value in step_data.items() if key not in {"logs", "security"}},
+                "deployment": payload.deployment,
+            },
+        )
         return {"message": "step recorded"}
 
     # pipeline_complete: final callback
@@ -239,10 +272,150 @@ async def receive_result(payload: PipelineResultPayload) -> dict[str, str]:
     )
     job_state[payload.job_id] = existing
 
+    if payload.deployment:
+        await _save_deployment_snapshot(payload.job_id, payload.deployment)
+    await pipeline_event_hub.publish(
+        payload.job_id,
+        {
+            "schema_version": 1,
+            "type": "pipeline_complete",
+            "job_id": payload.job_id,
+            "status": payload.effective_status,
+            "deployment": payload.deployment,
+            "ended_at": obj.get("ended_at"),
+        },
+    )
+    await pipeline_event_hub.clear(payload.job_id)
+
     # Clean up step tracking
     job_steps.pop(payload.job_id, None)
 
     return {"message": "result stored"}
+
+
+def _verify_callback_token(request: Request) -> None:
+    """Require the shared engine token when it is configured on the backend."""
+    expected = get_settings().engine_shared_token
+    if not expected:
+        return
+    received = request.headers.get("x-callback-token", "")
+    if not secrets.compare_digest(received, expected):
+        raise HTTPException(status_code=401, detail="invalid callback token")
+
+
+async def _append_stream_log_batch(payload: PipelineResultPayload) -> list[dict]:
+    """Append only unseen sequence numbers and return the accepted events."""
+    grouped: dict[str, list[dict]] = {}
+    for event in payload.events:
+        if not isinstance(event, dict):
+            continue
+        step_name = str(event.get("step_name") or "unknown")[:100]
+        try:
+            sequence = int(event.get("sequence"))
+        except (TypeError, ValueError):
+            continue
+        grouped.setdefault(step_name, []).append({**event, "sequence": sequence})
+
+    accepted: list[dict] = []
+    now = datetime.now(timezone.utc)
+    try:
+        async with SessionLocal() as session:
+            for step_name, events in grouped.items():
+                events.sort(key=lambda item: item["sequence"])
+                await session.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+                    {"lock_key": f"pipeline-step:{payload.job_id}:{step_name}"},
+                )
+                result = await session.execute(
+                    select(PipelineStep)
+                    .where(PipelineStep.job_id == payload.job_id, PipelineStep.step_name == step_name)
+                    .order_by(PipelineStep.created_at)
+                    .limit(1)
+                )
+                step = result.scalar_one_or_none()
+                if step and step.status in {"success", "failed", "skipped"}:
+                    continue
+                if step is None:
+                    step = PipelineStep(
+                        job_id=payload.job_id,
+                        step_name=step_name,
+                        step_type=step_name,
+                        status="running",
+                        started_at=now,
+                        metadata_={},
+                    )
+                    session.add(step)
+                    await session.flush()
+
+                metadata = dict(step.metadata_ or {})
+                last_sequence = int(metadata.get("log_sequence_end") or 0)
+                new_events = [event for event in events if event["sequence"] > last_sequence]
+                if not new_events:
+                    continue
+                lines = [str(event.get("message") or "") for event in new_events]
+                log_result = await session.execute(
+                    select(StepLog)
+                    .where(StepLog.step_id == step.step_id)
+                    .order_by(StepLog.log_id)
+                    .limit(1)
+                )
+                step_log = log_result.scalar_one_or_none()
+                appended = "\n".join(lines)
+                if step_log:
+                    step_log.log_content = f"{step_log.log_content}\n{appended}" if step_log.log_content else appended
+                    step_log.log_level = _log_level(step_log.log_content.splitlines())
+                    step_log.delivery_id = payload.event_id
+                    step_log.content_sha256 = sha256(step_log.log_content.encode("utf-8")).hexdigest()
+                    step_log.line_count = len(step_log.log_content.splitlines())
+                    step_log.size_bytes = len(step_log.log_content.encode("utf-8"))
+                    step_log.source = "log_batch"
+                    step_log.timestamp = now
+                else:
+                    step_log = StepLog(
+                        job_id=payload.job_id,
+                        step_id=step.step_id,
+                        log_level=_log_level(lines),
+                        log_content=appended,
+                        delivery_id=payload.event_id,
+                        content_sha256=sha256(appended.encode("utf-8")).hexdigest(),
+                        line_count=len(lines),
+                        size_bytes=len(appended.encode("utf-8")),
+                        source="log_batch",
+                        timestamp=now,
+                    )
+                    session.add(step_log)
+                metadata["log_sequence_end"] = new_events[-1]["sequence"]
+                step.metadata_ = metadata
+                step.log_line_count = step_log.line_count
+                step.log_size_bytes = step_log.size_bytes
+                accepted.extend(new_events)
+
+            job = await session.get(PipelineJob, payload.job_id)
+            if job:
+                job.status = "running"
+                job.last_event_at = now
+            await session.commit()
+    except Exception as exc:
+        print(f"[DB] log_batch append failed: {exc}")
+        # The live stream still works during a DB outage. step_complete later
+        # reconciles the authoritative full step log.
+        return [event for events in grouped.values() for event in events]
+    return sorted(accepted, key=lambda item: item["sequence"])
+
+
+async def _save_deployment_snapshot(job_id: str, deployment: dict) -> None:
+    try:
+        async with SessionLocal() as session:
+            job = await session.get(PipelineJob, job_id)
+            if not job:
+                return
+            metadata = dict(job.metadata_ or {})
+            metadata["deployment"] = deployment
+            job.metadata_ = metadata
+            job.last_event_at = datetime.now(timezone.utc)
+            await session.commit()
+    except Exception as exc:
+        print(f"[DB] deployment snapshot failed: {exc}")
 
 
 async def _ensure_job_exists(payload: PipelineResultPayload) -> None:
@@ -276,7 +449,13 @@ def _normalise_step_log_lines(raw_lines: list) -> list[str]:
     lines: list[str] = []
     for raw in raw_lines:
         line = str(raw)
-        if line.startswith(("[step_status]", "[step_summary]", "[step_exit_code]", "[exit_code]")):
+        content = re.sub(
+            r"^\[\d{4}-\d{2}-\d{2}[ T][^\]]+\]\s*",
+            "",
+            line,
+            count=1,
+        )
+        if content.startswith(("[step_status]", "[step_summary]", "[step_exit_code]", "[exit_code]")):
             continue
         lines.append(line)
     return lines
@@ -330,7 +509,9 @@ async def _upsert_step_log(
         existing_bytes = existing.size_bytes or len((existing.log_content or "").encode("utf-8"))
         # pipeline_complete의 전체 로그는 줄 수가 제한될 수 있으므로,
         # step_complete로 이미 받은 더 긴 로그를 덮어쓰지 않는다.
-        if content_bytes >= existing_bytes:
+        if (
+            source == "step_complete" and existing.source == "log_batch"
+        ) or content_bytes >= existing_bytes:
             existing.log_level = _log_level(lines)
             existing.log_content = content
             existing.delivery_id = delivery_id or existing.delivery_id
@@ -1778,8 +1959,20 @@ async def delete_pipeline(
 
 
 @app.get("/api/pipelines/{job_id}/logs")
-async def get_pipeline_logs(job_id: str) -> dict:
+async def get_pipeline_logs(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
     """파이프라인 로그 조회 (path parameter)."""
+    async with SessionLocal() as session:
+        job = await session.get(PipelineJob, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="job not found")
+        _assert_job_owner(job, _authenticated_user_id(current_user))
+    return {"job_id": job_id, "lines": await _load_pipeline_log_lines(job_id)}
+
+
+async def _load_pipeline_log_lines(job_id: str) -> list[str]:
     try:
         async with SessionLocal() as session:
             result = await session.execute(
@@ -1796,21 +1989,107 @@ async def get_pipeline_logs(job_id: str) -> dict:
                 if log_content:
                     for line in log_content.splitlines():
                         lines.append(f"[{step_name}.log] {line}")
-            return {"job_id": job_id, "lines": lines}
+            return lines
     except Exception as exc:
         print(f"[pipeline logs] DB query failed: {exc}")
 
     # fallback: 메모리/파일에서 조회
-    lines = result_fetcher.fetch_log_lines(job_id)
-    return {"job_id": job_id, "lines": lines}
+    return result_fetcher.fetch_log_lines(job_id)
+
+
+def _deployment_from_job(job: PipelineJob) -> dict | None:
+    metadata = job.metadata_ or {}
+    deployment = metadata.get("deployment") or metadata.get("service")
+    return deployment if isinstance(deployment, dict) else None
+
+
+def _assert_job_owner(job: PipelineJob, user_id: int) -> None:
+    if job.user_id is not None and int(job.user_id) != int(user_id):
+        raise HTTPException(status_code=403, detail="job does not belong to current user")
+
+
+@app.get("/api/pipelines/{job_id}/deployment")
+async def get_pipeline_deployment(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """Return the engine-authored deployment URL snapshot for the frontend."""
+    async with SessionLocal() as session:
+        job = await session.get(PipelineJob, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="job not found")
+        _assert_job_owner(job, _authenticated_user_id(current_user))
+        return {
+            "job_id": job_id,
+            "status": job.status,
+            "deployment": _deployment_from_job(job),
+        }
+
+
+@app.websocket("/api/pipelines/{job_id}/logs/ws")
+async def pipeline_log_websocket(websocket: WebSocket, job_id: str) -> None:
+    """Authenticate once, send a snapshot, then stream log/step/deploy events."""
+    await websocket.accept()
+    origin = websocket.headers.get("origin")
+    if origin and origin not in _get_allowed_origins():
+        await websocket.close(code=4403, reason="origin not allowed")
+        return
+
+    try:
+        auth_message = await asyncio.wait_for(websocket.receive_json(), timeout=5)
+        if auth_message.get("type") != "authenticate" or not auth_message.get("token"):
+            await websocket.close(code=4401, reason="authentication required")
+            return
+        claims = decode_token(str(auth_message["token"]))
+        user_id = claims.get("uid")
+        if user_id is None:
+            await websocket.close(code=4401, reason="invalid token payload")
+            return
+
+        async with SessionLocal() as session:
+            job = await session.get(PipelineJob, job_id)
+            if not job:
+                await websocket.close(code=4404, reason="job not found")
+                return
+            if job.user_id is not None and int(job.user_id) != int(user_id):
+                await websocket.close(code=4403, reason="forbidden")
+                return
+
+        fallback_lines = await _load_pipeline_log_lines(job_id)
+        await websocket.send_json(
+            {"schema_version": 1, "type": "authenticated", "job_id": job_id}
+        )
+        await pipeline_event_hub.subscribe(
+            job_id,
+            websocket,
+            fallback_lines=fallback_lines,
+        )
+        while True:
+            message = await websocket.receive_json()
+            if message.get("type") == "ping":
+                await websocket.send_json({"type": "pong", "job_id": job_id})
+    except WebSocketDisconnect:
+        pass
+    except (HTTPException, asyncio.TimeoutError, ValueError, TypeError):
+        try:
+            await websocket.close(code=4401, reason="authentication failed")
+        except RuntimeError:
+            pass
+    finally:
+        await pipeline_event_hub.unsubscribe(job_id, websocket)
 
 
 @app.get("/api/pipelines/{job_id}/steps")
-async def get_pipeline_steps(job_id: str) -> dict:
+async def get_pipeline_steps(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
     """파이프라인 step 목록 조회 (path parameter). job summary 필드 포함."""
     try:
         async with SessionLocal() as session:
             job = await session.get(PipelineJob, job_id)
+            if job:
+                _assert_job_owner(job, _authenticated_user_id(current_user))
 
             result = await session.execute(
                 select(PipelineStep)
@@ -1876,6 +2155,7 @@ async def get_job_result(
             job = await session.get(PipelineJob, job_id)
             if not job:
                 raise HTTPException(status_code=404, detail="job not found")
+            _assert_job_owner(job, _authenticated_user_id(current_user))
 
             # 진행 중인 job은 빈 findings 반환
             if job.status in ("queued", "running"):
@@ -1884,6 +2164,7 @@ async def get_job_result(
                     "repo_url": job.repo_url,
                     "branch": job.branch,
                     "completed_at": None,
+                    "deployment": _deployment_from_job(job),
                     "scores": {"security_score": 0, "code_quality_score": 0},
                     "verdict": {"overall_status": "pending", "status_reason": "파이프라인 실행 중", "total_findings": 0},
                     "severity_summary": {"critical": 0, "high": 0, "medium": 0, "low": 0},
@@ -2001,6 +2282,7 @@ async def get_job_result(
                 "branch": job.branch,
                 "commit_sha": job.commit_sha,
                 "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+                "deployment": _deployment_from_job(job),
                 "scores": {
                     "security_score": sec_score,
                     "score_label": summary.score_label if summary else None,

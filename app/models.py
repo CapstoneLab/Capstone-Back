@@ -41,6 +41,7 @@ class StartPipelineResponse(BaseModel):
 
 
 class PipelineResultPayload(BaseModel):
+    schema_version: int = 1
     job_id: str
     # Engine sends "status" for pipeline_complete, "pipeline_status" for step_complete
     status: Literal["success", "failed", "running"] | None = None
@@ -53,9 +54,16 @@ class PipelineResultPayload(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     steps: list[dict[str, Any]] = Field(default_factory=list)
     security: dict[str, Any] = Field(default_factory=dict)
+    deployment: dict[str, Any] | None = None
     # Engine sends these at top level for step_complete callbacks
     type: str | None = None
     step: dict[str, Any] = Field(default_factory=dict)
+    # Real-time log_batch callback fields.
+    event_id: str | None = None
+    run_id: str | None = None
+    sequence_start: int | None = None
+    sequence_end: int | None = None
+    events: list[dict[str, Any]] = Field(default_factory=list)
 
     @property
     def effective_status(self) -> str:
