@@ -240,6 +240,8 @@ async def receive_result(payload: PipelineResultPayload, request: Request) -> di
                 "schema_version": 1,
                 "type": "step_complete",
                 "job_id": payload.job_id,
+                "step_name": step_data.get("step_name") or step_data.get("name"),
+                "status": step_data.get("status"),
                 "step": {key: value for key, value in step_data.items() if key not in {"logs", "security"}},
                 "deployment": payload.deployment,
             },
@@ -2056,9 +2058,6 @@ async def pipeline_log_websocket(websocket: WebSocket, job_id: str) -> None:
                 return
 
         fallback_lines = await _load_pipeline_log_lines(job_id)
-        await websocket.send_json(
-            {"schema_version": 1, "type": "authenticated", "job_id": job_id}
-        )
         await pipeline_event_hub.subscribe(
             job_id,
             websocket,

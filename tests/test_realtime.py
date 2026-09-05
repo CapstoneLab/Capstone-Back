@@ -108,3 +108,40 @@ def test_callback_rejects_wrong_shared_token(monkeypatch) -> None:
     )
 
     assert response.status_code == 401
+
+
+def test_step_complete_realtime_event_has_frontend_contract_fields(monkeypatch) -> None:
+    published: list[dict] = []
+
+    class _Settings:
+        engine_shared_token = ""
+
+    async def _publish(job_id: str, payload: dict) -> None:
+        published.append(payload)
+
+    monkeypatch.setattr(main, "get_settings", lambda: _Settings())
+    monkeypatch.setattr(main.pipeline_event_hub, "publish", _publish)
+
+    client = TestClient(app)
+    response = client.post(
+        "/get-results",
+        json={
+            "type": "step_complete",
+            "job_id": "00000000-0000-0000-0000-000000000001",
+            "repo_url": "https://github.com/example/repo.git",
+            "branch": "main",
+            "pipeline_status": "running",
+            "step": {
+                "step_name": "clone",
+                "status": "success",
+                "started_at": "2026-09-06T00:00:00+00:00",
+                "ended_at": "2026-09-06T00:00:01+00:00",
+                "duration_secs": 1,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert published[-1]["type"] == "step_complete"
+    assert published[-1]["step_name"] == "clone"
+    assert published[-1]["status"] == "success"
